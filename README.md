@@ -1,5 +1,7 @@
 # zgrpc
 
+[![CI](https://github.com/brez/zgrpc/actions/workflows/ci.yml/badge.svg)](https://github.com/brez/zgrpc/actions/workflows/ci.yml)
+
 Real gRPC over HTTP/2 (h2c) for Zig — actual wire protocol, verified against
 the reference `grpc-go` implementation.
 
@@ -11,6 +13,7 @@ zig build test              # unit + integration tests (65)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency baseline
+zig build bench-build       # compile the benchmark without running it
 ./interop/run.sh            # grpc-go interop suite (requires Go)
 ```
 

@@ -200,11 +200,14 @@ test "decoder yields several messages from a single chunk" {
     var d = Decoder.init(std.testing.allocator);
     defer d.deinit();
 
-    try d.push(&.{
-        0, 0, 0, 0, 2, 'h', 'i',
-        0, 0, 0, 0, 3, 'b', 'y', 'e',
-        0, 0, 0, 0, 0,
-    });
+    // One message per line; concatenated rather than written as one array
+    // literal so the framing stays visible instead of being reflowed into a
+    // grid by zig fmt.
+    const wire =
+        [_]u8{ 0, 0, 0, 0, 2, 'h', 'i' } ++
+        [_]u8{ 0, 0, 0, 0, 3, 'b', 'y', 'e' } ++
+        [_]u8{ 0, 0, 0, 0, 0 };
+    try d.push(&wire);
 
     try std.testing.expectEqualStrings("hi", (try d.next()).?.payload);
     try std.testing.expectEqualStrings("bye", (try d.next()).?.payload);

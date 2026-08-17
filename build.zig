@@ -56,10 +56,18 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zgrpc", .module = mod }},
         }),
     });
-    b.installArtifact(bench);
+    // Deliberately not part of the default install: a ReleaseFast build of the
+    // benchmark costs minutes and nothing else needs it.
+    const bench_install = b.addInstallArtifact(bench, .{});
 
     const bench_step = b.step("bench", "Run the loopback latency benchmark");
+    bench_step.dependOn(&bench_install.step);
     bench_step.dependOn(&b.addRunArtifact(bench).step);
+
+    // Compiling the benchmark without running it: CI can catch bit-rot in it
+    // without depending on timings from a noisy shared runner.
+    const bench_build_step = b.step("bench-build", "Compile the benchmark without running it");
+    bench_build_step.dependOn(&bench_install.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);

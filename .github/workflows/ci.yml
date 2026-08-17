@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes an in-flight run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        # Scoped to our own sources: the build fetches dependencies into
+        # zig-pkg/, and their formatting is not ours to enforce.
+        run: zig fmt --check build.zig src examples
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test-unit --summary all
+
+      - name: Integration tests
+        # Real client/server over loopback TCP.
+        run: zig build test-integration --summary all
+
+      - name: Compile benchmark
+        # Built but not run: timings from a shared runner are too noisy to
+        # assert on, but the code should still be kept compiling.
+        run: zig build bench-build
+
+  interop:
+    name: grpc-go interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: interop/go.sum
+
+      - name: Run grpc-go interop suite
+        # The check that actually proves we speak gRPC rather than a dialect
+        # our own client happens to agree with.
+        run: ./interop/run.sh
