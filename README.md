@@ -130,12 +130,12 @@ after  TCP_NODELAY:  64 B  p50    18.5us  p99   21.1us  p999    32.5us
 ```
 
 A p50 of 95µs beside a p999 of 48ms — a 1,478x tail — is the signature of
-Nagle's algorithm meeting
-the peer's delayed ACK. gRPC is a ping-pong of small writes, which is precisely
-the pattern where the sender withholds a small segment awaiting an ACK the
-receiver is withholding awaiting more data; on Linux the standoff breaks only
-when the 40ms delayed-ACK timer fires. `std.Io.net` does not set TCP_NODELAY,
-so `src/tcp.zig` sets it on both accepted and dialled sockets.
+Nagle's algorithm meeting the peer's delayed ACK. gRPC is a ping-pong of small
+writes, which is precisely the pattern where the sender withholds a small
+segment awaiting an ACK the receiver is withholding awaiting more data; on
+Linux the standoff breaks only when the 40ms delayed-ACK timer fires.
+`std.Io.net` does not set TCP_NODELAY, so `src/tcp.zig` sets it on both
+accepted and dialled sockets.
 
 Two lessons for milestone 2: percentiles were essential (the mean and p50 both
 looked fine while one call in a thousand took 48ms), and a bad tail is worth
@@ -199,3 +199,7 @@ examples/echo_server.zig standalone server (interop target)
 examples/bench.zig       loopback latency baseline
 interop/                 grpc-go interop suite
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
