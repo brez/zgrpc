@@ -78,6 +78,12 @@ pub const Frame = struct {
     payload: []const u8,
 };
 
+/// An owned copy of a frame, used when one has to outlive `payload_buf`.
+const StoredFrame = struct {
+    header: FrameHeader,
+    payload: []u8,
+};
+
 pub const GoAway = struct {
     last_stream_id: u32,
     error_code: u32,
@@ -109,7 +115,22 @@ pub const Connection = struct {
     /// Bytes received since we last told the peer to open the window back up.
     unacked_recv: u32 = 0,
 
+    /// Streams the peer has reset. A cancelled stream never gets another
+    /// WINDOW_UPDATE, so a sender that does not track this waits forever for
+    /// flow-control credit that is never coming.
+    reset_streams: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Streams *we* reset. Their flow-control window must not be replenished:
+    /// continuing to grant credit for a stream we have abandoned is what lets a
+    /// peer keep producing into it indefinitely.
+    locally_reset: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
     goaway_received: ?GoAway = null,
+
+    /// A frame that was read by code which does not own it — the flow-control
+    /// wait loop in `writeData` — and must be handed to the next reader instead
+    /// of dropped. Dropping one loses a whole request: a client is free to open
+    /// a new stream while a long response is still being written.
+    pending_frame: ?StoredFrame = null,
 
     /// Scratch buffer reused for encoding header blocks, so a steady stream of
     /// calls does not allocate per request.
@@ -140,12 +161,34 @@ pub const Connection = struct {
         self.header_buf.deinit(self.allocator);
         self.payload_buf.deinit(self.allocator);
         self.stream_windows.deinit(self.allocator);
+        self.reset_streams.deinit(self.allocator);
+        self.locally_reset.deinit(self.allocator);
+        if (self.pending_frame) |stored| self.allocator.free(stored.payload);
+    }
+
+    /// Keeps a frame for the next reader. Only one slot: this server handles a
+    /// single call at a time, so at most one request can be queued behind the
+    /// response in flight. A second would mean a client pipelining more deeply
+    /// than this server supports, and is reported rather than silently lost.
+    fn stashFrame(self: *Connection, frame: Frame) !void {
+        if (self.pending_frame != null) return error.TooManyPendingFrames;
+        self.pending_frame = .{
+            .header = frame.header,
+            .payload = try self.allocator.dupe(u8, frame.payload),
+        };
+    }
+
+    /// True once the peer has sent RST_STREAM for this stream.
+    pub fn isStreamReset(self: *const Connection, stream_id: u32) bool {
+        return self.reset_streams.contains(stream_id);
     }
 
     /// Drops per-stream state once a call has completed. Without this the
     /// window map grows for the life of a long-lived connection.
     pub fn releaseStream(self: *Connection, stream_id: u32) void {
         _ = self.stream_windows.remove(stream_id);
+        _ = self.reset_streams.remove(stream_id);
+        _ = self.locally_reset.remove(stream_id);
     }
 
     /// Send window for `stream_id`, created at the peer's advertised initial
@@ -285,6 +328,11 @@ pub const Connection = struct {
 
         var offset: usize = 0;
         while (offset < data.len) {
+            // A cancelled stream must stop producing immediately; continuing
+            // would write into a stream the peer has discarded and, worse,
+            // block forever waiting on credit it will never grant.
+            if (self.isStreamReset(stream_id)) return error.StreamReset;
+
             // Block until both the connection and this stream have budget.
             // Anything already buffered must reach the peer first, or it will
             // never send the WINDOW_UPDATE being waited for — that deadlock is
@@ -294,8 +342,16 @@ pub const Connection = struct {
                 // `pumpOnce`, not `readFrame`: a WINDOW_UPDATE is precisely the
                 // frame being waited for, and `readFrame` would swallow it and
                 // keep blocking for a stream frame that cannot arrive.
-                _ = try self.pumpOnce();
+                if (try self.pumpOnce()) |frame| {
+                    // Anything for another stream is somebody else's call —
+                    // typically a new request opened while this response is
+                    // still going out. Keep it; dropping it strands the caller.
+                    if (frame.header.stream_id != stream_id and frame.header.stream_id != 0) {
+                        try self.stashFrame(frame);
+                    }
+                }
                 if (self.goaway_received != null) return error.ConnectionClosed;
+                if (self.isStreamReset(stream_id)) return error.StreamReset;
             }
 
             const available = @min(self.send_window, (try self.streamWindow(stream_id)).*);
@@ -318,6 +374,7 @@ pub const Connection = struct {
     }
 
     pub fn sendRstStream(self: *Connection, stream_id: u32, code: u32) !void {
+        try self.locally_reset.put(self.allocator, stream_id, {});
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u32, &payload, code, .big);
         try self.writeFrame(.RST_STREAM, 0, stream_id, &payload);
@@ -347,6 +404,15 @@ pub const Connection = struct {
     ///
     /// The returned payload is valid until the next read.
     pub fn readFrame(self: *Connection) !Frame {
+        if (self.pending_frame) |stored| {
+            self.pending_frame = null;
+            defer self.allocator.free(stored.payload);
+            // Moved into the shared buffer so the returned payload has the same
+            // lifetime as any other frame's.
+            self.payload_buf.clearRetainingCapacity();
+            try self.payload_buf.appendSlice(self.allocator, stored.payload);
+            return .{ .header = stored.header, .payload = self.payload_buf.items };
+        }
         while (true) {
             if (try self.pumpOnce()) |frame| return frame;
         }
@@ -402,6 +468,14 @@ pub const Connection = struct {
                     .last_stream_id = std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff,
                     .error_code = std.mem.readInt(u32, payload[4..8], .big),
                 };
+                return Frame{ .header = header, .payload = payload };
+            },
+            .RST_STREAM => {
+                // Recorded as well as returned. A sender blocked on this
+                // stream's flow-control window is the one that needs to know,
+                // and it is not the code reading frames here — the wait loop
+                // discards whatever `pumpOnce` hands back while it waits.
+                try self.reset_streams.put(self.allocator, header.stream_id, {});
                 return Frame{ .header = header, .payload = payload };
             },
             .DATA => {

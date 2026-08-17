@@ -5,15 +5,16 @@
 Real gRPC over HTTP/2 (h2c) for Zig — actual wire protocol, verified against
 the reference `grpc-go` implementation.
 
-Status: **milestone 1 complete.** Unary RPCs work end to end and interoperate
-with grpc-go. Server streaming is not implemented yet.
+Status: **unary and server streaming work end to end** and interoperate with
+grpc-go (milestones 1 and 3).
 
 ```
-zig build test              # unit + integration tests (65)
+zig build test              # unit + integration tests (72)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency baseline
 zig build bench-build       # compile the benchmark without running it
+zig build test-integration-build   # compile integration tests without running
 ./interop/run.sh            # grpc-go interop suite (requires Go)
 ```
 
@@ -31,7 +32,7 @@ fn sayHello(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
 }
 
 const methods = [_]zgrpc.Method{
-    .{ .path = "/helloworld.Greeter/SayHello", .handler = sayHello },
+    zgrpc.Method.unary("/helloworld.Greeter/SayHello", sayHello),
 };
 
 var server = try zgrpc.Server.listen(allocator, io, address, &methods, .{});
@@ -51,6 +52,37 @@ var response = try client.call("/helloworld.Greeter/SayHello", request_bytes, .{
 defer response.deinit();
 
 if (!response.call_status.isOk()) { /* response.call_status.code / .message */ }
+```
+
+Server streaming:
+
+```zig
+fn rangeQuery(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    var rows = try openCursor(ctx.allocator, request);
+    while (try rows.next()) |row| {
+        // Each send goes out immediately; nothing accumulates a full response.
+        // Returns error.StreamReset once the client cancels, which unwinds the
+        // handler and stops the query.
+        try stream.send(row);
+    }
+}
+
+const methods = [_]zgrpc.Method{
+    zgrpc.Method.serverStream("/tsdb.Query/Range", rangeQuery),
+};
+```
+
+Consuming one:
+
+```zig
+var stream = try client.callServerStream("/tsdb.Query/Range", request, .{});
+defer stream.deinit();
+
+while (try stream.next()) |message| {
+    // Borrows the decoder buffer; valid until the next `next` call. Copy to
+    // retain. This is what keeps streaming from allocating per message.
+}
+if (!stream.finalStatus().isOk()) { /* stream.finalStatus().code */ }
 ```
 
 Handlers take and return **bytes**, not generated types. Protobuf codegen
@@ -164,6 +196,22 @@ concurrently would corrupt each other. Consequences:
    the first thing to fix before the milestone-2 load benchmark, since it caps
    server throughput at one connection.
 
+**Stream cancellation is bounded by flow control, not immediate.** A client
+that abandons a stream sends RST_STREAM and stops replenishing that stream's
+flow-control window; the server notices when its write path next blocks for
+credit, and `stream.send` then returns `error.StreamReset`, unwinding the
+handler. This works, but detection is only as prompt as the window is small: a
+peer that advertises large or dynamically-grown windows (grpc-go does) can let
+a server produce well past the point of cancellation before it blocks and
+looks.
+
+Making it immediate needs the transport to read frames while it is writing,
+which this single-threaded design cannot do. A non-blocking `poll` before each
+send was tried and removed: `std.Io.net.Stream.Reader` latches its error state,
+so one failed `fillMore` poisons the reader and every later read fails with
+`error.ReadFailed`. The real fix is a reader that is not driven by the writer —
+the same restructuring the concurrency limit above needs.
+
 **No compression.** The compressed-message flag is parsed and rejected;
 `grpc-encoding` is not negotiated.
 
@@ -181,12 +229,25 @@ This is the check that matters for "must be real gRPC on the wire" — our own
 client agreeing with our own server proves only self-consistency. It covers
 the unary happy path, empty messages, messages spanning many DATA frames and
 exceeding the flow-control window, non-OK status codes with messages, unknown
-methods, and connection reuse across calls.
+methods, connection reuse across calls, and server streaming — ordered
+delivery, empty streams, long streams, and a mid-stream failure whose status
+must arrive in trailers after the messages already sent.
 
-Two bugs were found this way that the internal tests missed, both flow control:
-stream-level `WINDOW_UPDATE` frames were ignored entirely, and a sender blocked
-on a closed window would consume the very `WINDOW_UPDATE` it was waiting for
-and keep blocking. Any message over ~32KB deadlocked.
+Bugs found this way that the internal tests missed:
+
+- Stream-level `WINDOW_UPDATE` frames were ignored entirely; only the
+  connection window was tracked.
+- A sender blocked on a closed window consumed the very `WINDOW_UPDATE` it was
+  waiting for and kept blocking. Any message over ~32KB deadlocked.
+- The flow-control wait loop discarded every frame it read, so a request opened
+  while a long response was still being written was silently lost. Frames that
+  do not belong to the writer are now stashed for the next reader.
+
+Adding server streaming surfaced one more, caught by an internal test rather
+than interop: skipping a HEADERS frame for a stream we were not reading
+desynchronised HPACK. The dynamic table is connection-wide state built by every
+header block in order, so a skipped block corrupts every later one. Header
+blocks are now always decoded, even when discarded.
 
 ## Layout
 
@@ -195,8 +256,9 @@ src/h2.zig               HTTP/2 connection driver (frames + HPACK from http2.zig
 src/framing.zig          gRPC 5-byte length-prefixed message framing
 src/status.zig           grpc-status codes, percent-encoded grpc-message
 src/timeout.zig          grpc-timeout deadline encoding
-src/client.zig           unary client
-src/server.zig           unary server
+src/client.zig           unary + server-streaming client
+src/server.zig           unary + server-streaming server
+src/tcp.zig              TCP_NODELAY
 src/integration_test.zig end-to-end tests over loopback
 examples/echo_server.zig standalone server (interop target)
 examples/bench.zig       loopback latency baseline

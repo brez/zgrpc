@@ -8,6 +8,9 @@ const testing = std.testing;
 
 const echo_path = "/zgrpc.test.Echo/Call";
 const fail_path = "/zgrpc.test.Echo/Fail";
+const count_path = "/zgrpc.test.Echo/Count";
+const fail_mid_path = "/zgrpc.test.Echo/FailMidStream";
+const fail_early_path = "/zgrpc.test.Echo/FailEarlyStream";
 
 fn echoHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
     return ctx.allocator.dupe(u8, request);
@@ -18,9 +21,41 @@ fn failHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8
     return ctx.fail(.not_found, "no such widget");
 }
 
+/// Counts messages actually produced, so a test can tell whether a cancelled
+/// handler stopped early instead of running to completion.
+var sent_count: std.atomic.Value(usize) = .init(0);
+
+fn countHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    const n = try std.fmt.parseInt(usize, request, 10);
+    for (0..n) |i| {
+        var buf: [32]u8 = undefined;
+        try stream.send(try std.fmt.bufPrint(&buf, "item-{d}", .{i}));
+        _ = sent_count.fetchAdd(1, .monotonic);
+    }
+    _ = ctx;
+}
+
+/// Sends two messages and then fails, so the failure must land in trailers
+/// rather than as a Trailers-Only response.
+fn failMidStreamHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = request;
+    try stream.send("first");
+    try stream.send("second");
+    return ctx.fail(.data_loss, "ran out of data");
+}
+
+fn failEarlyStreamHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = request;
+    _ = stream;
+    return ctx.fail(.invalid_argument, "bad range");
+}
+
 const methods = [_]zgrpc.Method{
-    .{ .path = echo_path, .handler = echoHandler },
-    .{ .path = fail_path, .handler = failHandler },
+    zgrpc.Method.unary(echo_path, echoHandler),
+    zgrpc.Method.unary(fail_path, failHandler),
+    zgrpc.Method.serverStream(count_path, countHandler),
+    zgrpc.Method.serverStream(fail_mid_path, failMidStreamHandler),
+    zgrpc.Method.serverStream(fail_early_path, failEarlyStreamHandler),
 };
 
 const Harness = struct {
@@ -246,4 +281,210 @@ test "a message larger than one HTTP/2 frame is reassembled" {
 
     try testing.expectEqual(zgrpc.Code.ok, response.call_status.code);
     try testing.expectEqualSlices(u8, big, response.message);
+}
+
+test "server streaming yields every message in order" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var stream = try pair.client.callServerStream(count_path, "5", .{});
+    defer stream.deinit();
+
+    var seen: usize = 0;
+    while (try stream.next()) |msg| {
+        var expected: [32]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected, "item-{d}", .{seen}),
+            msg,
+        );
+        seen += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 5), seen);
+    try testing.expectEqual(zgrpc.Code.ok, stream.finalStatus().code);
+}
+
+test "a stream of zero messages is a clean, successful end" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var stream = try pair.client.callServerStream(count_path, "0", .{});
+    defer stream.deinit();
+
+    try testing.expectEqual(@as(?[]const u8, null), try stream.next());
+    try testing.expectEqual(zgrpc.Code.ok, stream.finalStatus().code);
+}
+
+test "a long stream is delivered without buffering it whole" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var stream = try pair.client.callServerStream(count_path, "1000", .{});
+    defer stream.deinit();
+
+    var seen: usize = 0;
+    while (try stream.next()) |msg| {
+        try testing.expect(std.mem.startsWith(u8, msg, "item-"));
+        seen += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 1000), seen);
+    try testing.expectEqual(zgrpc.Code.ok, stream.finalStatus().code);
+}
+
+test "failure after messages arrives in trailers, keeping the messages" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var stream = try pair.client.callServerStream(fail_mid_path, "", .{});
+    defer stream.deinit();
+
+    try testing.expectEqualStrings("first", (try stream.next()).?);
+    try testing.expectEqualStrings("second", (try stream.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try stream.next());
+
+    // The messages already delivered stay valid; the failure is reported only
+    // at the end of the stream.
+    try testing.expectEqual(zgrpc.Code.data_loss, stream.finalStatus().code);
+    try testing.expectEqualStrings("ran out of data", stream.finalStatus().message);
+}
+
+test "failure before any message collapses to a Trailers-Only response" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var stream = try pair.client.callServerStream(fail_early_path, "", .{});
+    defer stream.deinit();
+
+    try testing.expectEqual(@as(?[]const u8, null), try stream.next());
+    try testing.expectEqual(zgrpc.Code.invalid_argument, stream.finalStatus().code);
+    try testing.expectEqualStrings("bad range", stream.finalStatus().message);
+}
+
+test "streaming and unary calls interleave on one connection" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    for (0..3) |_| {
+        var stream = try pair.client.callServerStream(count_path, "3", .{});
+        var seen: usize = 0;
+        while (try stream.next()) |_| seen += 1;
+        try testing.expectEqual(@as(usize, 3), seen);
+        try testing.expectEqual(zgrpc.Code.ok, stream.finalStatus().code);
+        stream.deinit();
+
+        var response = try pair.client.call(echo_path, "still works", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("still works", response.message);
+    }
+}
+
+test "abandoning a stream early leaves the connection usable" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    const total = 20_000;
+    sent_count.store(0, .monotonic);
+    {
+        // Read two of many messages, then walk away. The count must be large
+        // enough that the server is still producing when the client gives up,
+        // or the test proves nothing about cancellation.
+        var stream = try pair.client.callServerStream(count_path, "20000", .{});
+        defer stream.deinit();
+        _ = try stream.next();
+        _ = try stream.next();
+    }
+
+    // The next call must not be confused by frames left over from the
+    // abandoned stream.
+    var response = try pair.client.call(echo_path, "after abandon", .{});
+    defer response.deinit();
+    try testing.expectEqual(zgrpc.Code.ok, response.call_status.code);
+    try testing.expectEqualStrings("after abandon", response.message);
+
+    // Cancellation must actually stop the handler, not merely be tolerated:
+    // a server that streams the whole result set into a discarded stream
+    // wastes the connection for as long as the query is large.
+    // Cancellation is bounded by flow control rather than instant: the server
+    // may fill the stream's 64KB window before it blocks and notices. What must
+    // not happen is streaming the whole result set into a discarded stream.
+    const produced = sent_count.load(.monotonic);
+    try testing.expect(produced < total);
 }

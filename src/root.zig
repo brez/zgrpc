@@ -23,6 +23,9 @@ pub const Status = status.Status;
 pub const Client = client.Client;
 pub const Server = server.Server;
 pub const Method = server.Method;
+pub const ServerStream = server.ServerStream;
+pub const StreamHandler = server.StreamHandler;
+pub const ResponseStream = client.ResponseStream;
 pub const CallContext = server.CallContext;
 pub const MethodHandler = server.MethodHandler;
 

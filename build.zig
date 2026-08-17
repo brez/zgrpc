@@ -78,4 +78,14 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run integration tests only");
     integration_step.dependOn(&run_integration_tests.step);
+
+    // Compiling the integration tests without running them, so a hang can be
+    // debugged against the binary directly (`zig build` buffers child output
+    // and shows nothing when a test never returns).
+    const integration_install = b.addInstallArtifact(integration_tests, .{});
+    const integration_build_step = b.step(
+        "test-integration-build",
+        "Compile integration tests without running them",
+    );
+    integration_build_step.dependOn(&integration_install.step);
 }

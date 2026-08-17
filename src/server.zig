@@ -1,4 +1,4 @@
-//! Unary gRPC server over h2c.
+//! gRPC server over h2c: unary and server-streaming methods.
 //!
 //! Concurrency: connections are served one at a time on the calling thread.
 //! This is deliberate for now — the HPACK decoder in the upstream `http2.zig`
@@ -46,10 +46,91 @@ pub const CallContext = struct {
 /// about protobuf message types.
 pub const MethodHandler = *const fn (ctx: *CallContext, request: []const u8) anyerror![]const u8;
 
+/// A server-streaming method implementation: one request in, any number of
+/// responses out via `stream.send`.
+///
+/// Returning normally ends the stream with the status on `ctx` (OK unless the
+/// handler set otherwise).
+pub const StreamHandler = *const fn (
+    ctx: *CallContext,
+    request: []const u8,
+    stream: *ServerStream,
+) anyerror!void;
+
+pub const Handler = union(enum) {
+    unary: MethodHandler,
+    server_stream: StreamHandler,
+};
+
 pub const Method = struct {
     /// Fully-qualified path: `/package.Service/Method`.
     path: []const u8,
-    handler: MethodHandler,
+    handler: Handler,
+
+    pub fn unary(path: []const u8, handler: MethodHandler) Method {
+        return .{ .path = path, .handler = .{ .unary = handler } };
+    }
+
+    pub fn serverStream(path: []const u8, handler: StreamHandler) Method {
+        return .{ .path = path, .handler = .{ .server_stream = handler } };
+    }
+};
+
+/// The handle a server-streaming handler uses to emit messages.
+///
+/// Messages go out as they are produced. Nothing accumulates a full response
+/// here, which is the entire point: a range query that materialises every row
+/// before the client sees the first one is not streaming, whatever the wire
+/// format says.
+pub const ServerStream = struct {
+    allocator: std.mem.Allocator,
+    conn: *h2.Connection,
+    stream_id: u32,
+    /// Response HEADERS are written lazily on the first `send`, so a handler
+    /// that fails before producing anything can still be answered with a
+    /// compact Trailers-Only response.
+    headers_sent: bool = false,
+    /// Reused across sends so streaming N messages does not mean N allocations.
+    frame_buf: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *ServerStream) void {
+        self.frame_buf.deinit(self.allocator);
+    }
+
+    /// Sends one message. `message` is not retained.
+    ///
+    /// Returns `error.StreamReset` once the client has cancelled, which
+    /// unwinds the handler and stops it producing. Handlers that loop over a
+    /// large result set get this for free from `try stream.send(...)`.
+    pub fn send(self: *ServerStream, message: []const u8) !void {
+        // Cancellation is noticed when the write path blocks for flow-control
+        // credit and reads the pending RST_STREAM. See "Known constraints" in
+        // the README for why detection is bounded by the peer's window rather
+        // than immediate.
+        if (self.conn.isStreamReset(self.stream_id)) return error.StreamReset;
+
+        if (!self.headers_sent) {
+            try self.conn.writeHeaders(self.stream_id, &.{
+                .{ .name = ":status", .value = "200" },
+                .{ .name = "content-type", .value = "application/grpc+proto" },
+            }, false);
+            self.headers_sent = true;
+        }
+
+        self.frame_buf.clearRetainingCapacity();
+        const needed = framing.header_len + message.len;
+        var writer = std.Io.Writer.fixed(
+            try self.frame_buf.addManyAsSlice(self.allocator, needed),
+        );
+        try framing.writeMessage(&writer, message);
+
+        try self.conn.writeData(self.stream_id, self.frame_buf.items, false);
+        // Flushed per message on purpose. Letting messages sit until the 64KB
+        // write buffer happens to fill would make delivery depend on message
+        // size rather than on the handler producing them, which defeats
+        // streaming for exactly the small-message case that needs it.
+        try self.conn.flush();
+    }
 };
 
 pub const Options = struct {
@@ -198,23 +279,61 @@ pub const Server = struct {
             .request_headers = &headers,
         };
 
-        const response = handler(&ctx, request_bytes) catch |err| {
-            // A handler that set an explicit status keeps it; anything else is
-            // an unexpected failure and maps to INTERNAL.
-            const failed: Status = if (ctx.status.isOk())
-                .{ .code = .internal, .message = @errorName(err) }
-            else
-                ctx.status;
-            try self.respondStatusOnly(conn, stream_id, failed);
-            return;
-        };
+        switch (handler) {
+            .unary => |call| {
+                const response = call(&ctx, request_bytes) catch |err| {
+                    try self.respondStatusOnly(conn, stream_id, failureStatus(&ctx, err));
+                    return;
+                };
 
-        if (!ctx.status.isOk()) {
-            try self.respondStatusOnly(conn, stream_id, ctx.status);
+                if (!ctx.status.isOk()) {
+                    try self.respondStatusOnly(conn, stream_id, ctx.status);
+                    return;
+                }
+
+                try self.respond(conn, stream_id, response, Status.ok);
+            },
+
+            .server_stream => |call| {
+                var stream: ServerStream = .{
+                    .allocator = self.allocator,
+                    .conn = conn,
+                    .stream_id = stream_id,
+                };
+                defer stream.deinit();
+
+                if (call(&ctx, request_bytes, &stream)) |_| {
+                    try self.finishStream(conn, stream_id, &stream, ctx.status);
+                } else |err| {
+                    // A client that cancelled has already torn the stream down.
+                    // There is nothing to report to and nothing to report — it
+                    // is a normal end to the call, not a failure.
+                    if (err == error.StreamReset or conn.isStreamReset(stream_id)) return;
+
+                    // Once any message has gone out the response headers are
+                    // already on the wire, so the failure has to be reported in
+                    // trailers rather than as a Trailers-Only response.
+                    try self.finishStream(conn, stream_id, &stream, failureStatus(&ctx, err));
+                }
+            },
+        }
+    }
+
+    fn finishStream(
+        self: *Server,
+        conn: *h2.Connection,
+        stream_id: u32,
+        stream: *ServerStream,
+        call_status: Status,
+    ) !void {
+        if (!stream.headers_sent) {
+            // A stream that produced nothing collapses to Trailers-Only, which
+            // is legal for both an empty success and an early failure.
+            try self.respondStatusOnly(conn, stream_id, call_status);
             return;
         }
-
-        try self.respond(conn, stream_id, response, Status.ok);
+        try self.writeTrailers(conn, stream_id, call_status);
+        try conn.flush();
     }
 
     fn readRequestMessage(
@@ -227,10 +346,11 @@ pub const Server = struct {
         _ = self;
         while (true) {
             const frame = try conn.readFrame();
-            if (frame.header.stream_id != stream_id) continue;
+            const mine = frame.header.stream_id == stream_id;
 
             switch (frame.header.frame_type) {
                 .DATA => {
+                    if (!mine) continue;
                     try decoder.push(h2.dataPayload(frame));
                     if (try decoder.next()) |msg| {
                         // Copy out: the decoder's buffer is reused, and the
@@ -243,17 +363,28 @@ pub const Server = struct {
                     }
                 },
                 // Trailing HEADERS from the client ends the request stream.
+                // Decoded unconditionally: HPACK's dynamic table is
+                // connection-wide, so a skipped block corrupts later ones.
                 .HEADERS => {
-                    if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) return "";
+                    var headers = try conn.readHeaderBlock(frame);
+                    headers.deinit();
+                    if (mine and frame.header.flags.has(h2.FrameFlags.END_STREAM)) return "";
                 },
-                .RST_STREAM => return error.StreamReset,
+                .RST_STREAM => if (mine) return error.StreamReset,
                 .GOAWAY => return error.ConnectionClosed,
                 else => {},
             }
         }
     }
 
-    fn lookup(self: *Server, path: []const u8) ?MethodHandler {
+    /// A handler that set an explicit status keeps it; anything else is an
+    /// unexpected failure and maps to INTERNAL.
+    fn failureStatus(ctx: *const CallContext, err: anyerror) Status {
+        if (ctx.status.isOk()) return .{ .code = .internal, .message = @errorName(err) };
+        return ctx.status;
+    }
+
+    fn lookup(self: *Server, path: []const u8) ?Handler {
         for (self.methods) |m| {
             if (std.mem.eql(u8, m.path, path)) return m.handler;
         }

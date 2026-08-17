@@ -17,9 +17,30 @@ fn fail(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
     return ctx.fail(.permission_denied, "denied by policy");
 }
 
+/// Streams `request` (a decimal count) messages back, one per item.
+fn count(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = ctx;
+    const n = std.fmt.parseInt(usize, request, 10) catch 0;
+    for (0..n) |i| {
+        var buf: [32]u8 = undefined;
+        try stream.send(try std.fmt.bufPrint(&buf, "item-{d}", .{i}));
+    }
+}
+
+/// Emits two messages and then fails, so the status has to travel in trailers
+/// after a body rather than as a Trailers-Only response.
+fn countThenFail(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = request;
+    try stream.send("first");
+    try stream.send("second");
+    return ctx.fail(.data_loss, "ran out of data");
+}
+
 const methods = [_]zgrpc.Method{
-    .{ .path = "/zgrpc.test.Echo/Call", .handler = echo },
-    .{ .path = "/zgrpc.test.Echo/Fail", .handler = fail },
+    zgrpc.Method.unary("/zgrpc.test.Echo/Call", echo),
+    zgrpc.Method.unary("/zgrpc.test.Echo/Fail", fail),
+    zgrpc.Method.serverStream("/zgrpc.test.Echo/Count", count),
+    zgrpc.Method.serverStream("/zgrpc.test.Echo/CountThenFail", countThenFail),
 };
 
 pub fn main() !void {

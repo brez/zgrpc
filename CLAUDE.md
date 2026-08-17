@@ -114,6 +114,7 @@ consumer to validate the abstractions against:
 - `zig build test-unit` — pure unit tests only (no sockets)
 - `zig build test-integration` — real client/server over loopback
 - `zig build bench` — loopback latency baseline (NOT the milestone-2 number)
+- `zig build bench-build` / `zig build test-integration-build` — compile only
 - `./interop/run.sh` — grpc-go interop suite; requires Go
 
 ## Decisions made
@@ -131,5 +132,11 @@ BoringSSL TLS targets; the `http2` module itself is BoringSSL-free.
 `CallContext` carrying the per-call arena, path, deadline and settable status.
 Protobuf codegen sits above the transport rather than inside it.
 
-Still open: connection pooling / concurrency model, and the milestone-2
-in-VPC benchmark numbers.
+**Server streaming (milestone 3) is done**: `Method.serverStream` +
+`ServerStream.send` on the server, `callServerStream` + `ResponseStream.next`
+on the client, verified against grpc-go. Messages are not buffered whole at
+either end.
+
+Still open: connection pooling / concurrency model, the milestone-2 in-VPC
+benchmark numbers, and prompt stream cancellation (currently bounded by the
+peer's flow-control window — see README "Known constraints").

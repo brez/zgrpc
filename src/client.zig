@@ -40,6 +40,128 @@ pub const Response = struct {
     }
 };
 
+/// An in-progress server-streaming call.
+///
+/// Messages are yielded as they arrive off the connection; nothing accumulates
+/// the full response. That is the point of the type — a range query over a
+/// large window must not require the client to hold every row at once.
+///
+/// The stream borrows its `Client` and holds the connection for the duration of
+/// the call, so it must be drained (or deinited) before another call is made on
+/// the same client.
+pub const ResponseStream = struct {
+    client: *Client,
+    stream_id: u32,
+    decoder: framing.Decoder,
+    /// Owns only the final status message, not the yielded payloads.
+    arena: std.heap.ArenaAllocator,
+
+    call_status: ?Status = null,
+    /// Set once END_STREAM has been seen; no more frames belong to this call.
+    ended: bool = false,
+
+    /// Ends the call. A stream abandoned before the server finished is
+    /// cancelled with RST_STREAM, which is what tells the peer to stop
+    /// producing — a caller that reads the first few rows of a long range
+    /// query and walks away should not leave the server streaming the rest
+    /// into a connection nobody is reading.
+    ///
+    /// Errors are swallowed: deinit runs on cleanup paths where there is
+    /// nothing useful to do with a failure, and the connection is already
+    /// suspect if this cannot be written.
+    pub fn deinit(self: *ResponseStream) void {
+        if (!self.ended) {
+            self.client.conn.sendRstStream(self.stream_id, h2.error_code_cancel) catch {};
+            self.client.conn.flush() catch {};
+        }
+        self.client.conn.releaseStream(self.stream_id);
+        self.decoder.deinit();
+        self.arena.deinit();
+    }
+
+    /// Returns the next message, or null once the server has finished.
+    ///
+    /// The returned slice borrows the decoder's buffer and is invalidated by
+    /// the following `next` call. A caller that needs to retain a message past
+    /// that point must copy it — which is the trade that keeps this from
+    /// allocating per message.
+    pub fn next(self: *ResponseStream) !?[]const u8 {
+        while (true) {
+            if (try self.decoder.next()) |msg| {
+                if (msg.compressed) return error.CompressionNotSupported;
+                return msg.payload;
+            }
+
+            if (self.ended) {
+                // A stream that ends mid-message was truncated; reporting it as
+                // a clean end would silently lose data.
+                if (!self.decoder.isDrained()) return error.TruncatedMessage;
+                return null;
+            }
+
+            try self.pump();
+        }
+    }
+
+    /// Reads one frame belonging to this call and applies it.
+    fn pump(self: *ResponseStream) !void {
+        const conn = &self.client.conn;
+        const frame = try conn.readFrame();
+        const mine = frame.header.stream_id == self.stream_id;
+
+        switch (frame.header.frame_type) {
+            .HEADERS => {
+                // Decoded even when the block belongs to another stream.
+                // HPACK's dynamic table is connection-wide state built by
+                // every header block in order, so skipping one leaves the
+                // decoder permanently out of step with the peer's encoder and
+                // corrupts every later block on the connection.
+                var headers = try conn.readHeaderBlock(frame);
+                defer headers.deinit();
+                if (!mine) return;
+
+                if (headers.get("grpc-status")) |code_text| {
+                    const code = try Code.fromTrailer(code_text);
+                    const raw = headers.get("grpc-message") orelse "";
+                    self.call_status = .{
+                        .code = code,
+                        .message = try status.decodeMessage(self.arena.allocator(), raw),
+                    };
+                } else if (headers.get(":status")) |http_status| {
+                    // A non-200 means the request never reached gRPC at all.
+                    if (!std.mem.eql(u8, http_status, "200")) {
+                        self.call_status = .{
+                            .code = .unavailable,
+                            .message = try self.arena.allocator().dupe(u8, http_status),
+                        };
+                    }
+                }
+
+                if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) self.ended = true;
+            },
+            .DATA => {
+                if (!mine) return;
+                try self.decoder.push(h2.dataPayload(frame));
+                if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) self.ended = true;
+            },
+            .RST_STREAM => if (mine) return error.StreamReset,
+            .GOAWAY => return error.ConnectionClosed,
+            else => {},
+        }
+    }
+
+    /// The call's final status. Only meaningful once `next` has returned null.
+    ///
+    /// A stream that ended without `grpc-status` is a protocol violation, and
+    /// is reported as such rather than being assumed successful.
+    pub fn finalStatus(self: *const ResponseStream) Status {
+        return self.call_status orelse .{
+            .code = .internal,
+            .message = "missing grpc-status trailer",
+        };
+    }
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -126,6 +248,44 @@ pub const Client = struct {
         request: []const u8,
         call_options: CallOptions,
     ) !Response {
+        const stream_id = try self.sendRequest(path, request, call_options);
+        defer self.conn.releaseStream(stream_id);
+        return self.readResponse(stream_id);
+    }
+
+    /// Starts a server-streaming call: send a single message, then read
+    /// responses one at a time via `ResponseStream.next`.
+    ///
+    /// The request half is identical to a unary call — server streaming is a
+    /// property of the response, not of the request — so the difference lives
+    /// entirely in how the response is consumed.
+    pub fn callServerStream(
+        self: *Client,
+        path: []const u8,
+        request: []const u8,
+        call_options: CallOptions,
+    ) !ResponseStream {
+        const stream_id = try self.sendRequest(path, request, call_options);
+        return .{
+            .client = self,
+            .stream_id = stream_id,
+            .decoder = decoder: {
+                var d = framing.Decoder.init(self.allocator);
+                d.max_message_bytes = self.options.max_message_bytes;
+                break :decoder d;
+            },
+            .arena = std.heap.ArenaAllocator.init(self.allocator),
+        };
+    }
+
+    /// Writes request HEADERS plus the single request message, and returns the
+    /// stream id the response will arrive on.
+    fn sendRequest(
+        self: *Client,
+        path: []const u8,
+        request: []const u8,
+        call_options: CallOptions,
+    ) !u32 {
         const stream_id = self.conn.openStream();
 
         var timeout_buf: [16]u8 = undefined;
@@ -169,8 +329,7 @@ pub const Client = struct {
         try self.conn.writeData(stream_id, body.items, true);
         try self.conn.flush();
 
-        defer self.conn.releaseStream(stream_id);
-        return self.readResponse(stream_id);
+        return stream_id;
     }
 
     fn readResponse(self: *Client, stream_id: u32) !Response {
@@ -188,12 +347,16 @@ pub const Client = struct {
 
         while (true) {
             const frame = try self.conn.readFrame();
-            if (frame.header.stream_id != stream_id and frame.header.frame_type != .GOAWAY) continue;
+            const mine = frame.header.stream_id == stream_id;
 
             switch (frame.header.frame_type) {
                 .HEADERS => {
+                    // Decoded even for other streams: HPACK's dynamic table is
+                    // connection-wide, so skipping a block desynchronizes the
+                    // decoder from the peer's encoder for good.
                     var headers = try self.conn.readHeaderBlock(frame);
                     defer headers.deinit();
+                    if (!mine) continue;
 
                     // A header block carrying grpc-status is the trailer block
                     // — or, for an empty response, a Trailers-Only block that
@@ -218,6 +381,7 @@ pub const Client = struct {
                     if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) break;
                 },
                 .DATA => {
+                    if (!mine) continue;
                     try decoder.push(h2.dataPayload(frame));
                     while (try decoder.next()) |msg| {
                         if (msg.compressed) return error.CompressionNotSupported;
@@ -226,7 +390,7 @@ pub const Client = struct {
                     }
                     if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) break;
                 },
-                .RST_STREAM => return error.StreamReset,
+                .RST_STREAM => if (mine) return error.StreamReset,
                 .GOAWAY => return error.ConnectionClosed,
                 else => {},
             }

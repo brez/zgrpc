@@ -12,7 +12,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -182,6 +184,103 @@ func main() {
 			if string(resp) != string(payload) {
 				return fmt.Errorf("call %d: got %q", i, resp)
 			}
+		}
+		return nil
+	}())
+
+	// Server streaming. grpc-go enforces the parts a self-consistent
+	// implementation can get away with ignoring: that the response is a single
+	// HEADERS frame followed by many messages, that io.EOF arrives only after
+	// the trailing HEADERS, and that a mid-stream failure is reported in
+	// trailers rather than by dropping the stream.
+	streamDesc := &grpc.StreamDesc{StreamName: "Count", ServerStreams: true}
+
+	recvAll := func(ctx context.Context, method string, req []byte) ([][]byte, error) {
+		st, err := cc.NewStream(ctx, streamDesc, method)
+		if err != nil {
+			return nil, err
+		}
+		if err := st.SendMsg(&req); err != nil {
+			return nil, err
+		}
+		if err := st.CloseSend(); err != nil {
+			return nil, err
+		}
+		var out [][]byte
+		for {
+			var msg []byte
+			err := st.RecvMsg(&msg)
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			if err != nil {
+				return out, err
+			}
+			out = append(out, msg)
+		}
+	}
+
+	check("server stream delivers every message in order", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		msgs, err := recvAll(ctx, "/zgrpc.test.Echo/Count", []byte("5"))
+		if err != nil {
+			return err
+		}
+		if len(msgs) != 5 {
+			return fmt.Errorf("got %d messages, want 5", len(msgs))
+		}
+		for i, m := range msgs {
+			want := fmt.Sprintf("item-%d", i)
+			if string(m) != want {
+				return fmt.Errorf("message %d = %q, want %q", i, m, want)
+			}
+		}
+		return nil
+	}())
+
+	check("empty server stream ends cleanly", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		msgs, err := recvAll(ctx, "/zgrpc.test.Echo/Count", []byte("0"))
+		if err != nil {
+			return err
+		}
+		if len(msgs) != 0 {
+			return fmt.Errorf("got %d messages, want 0", len(msgs))
+		}
+		return nil
+	}())
+
+	check("long server stream survives many messages", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		msgs, err := recvAll(ctx, "/zgrpc.test.Echo/Count", []byte("1000"))
+		if err != nil {
+			return err
+		}
+		if len(msgs) != 1000 {
+			return fmt.Errorf("got %d messages, want 1000", len(msgs))
+		}
+		return nil
+	}())
+
+	check("mid-stream failure reports in trailers after the messages", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		msgs, err := recvAll(ctx, "/zgrpc.test.Echo/CountThenFail", []byte(""))
+		if len(msgs) != 2 {
+			return fmt.Errorf("got %d messages before failure, want 2", len(msgs))
+		}
+		st, ok := status.FromError(err)
+		if !ok {
+			return fmt.Errorf("not a grpc status: %v", err)
+		}
+		if st.Code() != codes.DataLoss {
+			return fmt.Errorf("code = %v, want DataLoss", st.Code())
+		}
+		if st.Message() != "ran out of data" {
+			return fmt.Errorf("message = %q", st.Message())
 		}
 		return nil
 	}())
