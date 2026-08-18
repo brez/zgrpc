@@ -28,7 +28,7 @@ jobs:
       - name: Check formatting
         # Scoped to our own sources: the build fetches dependencies into
         # zig-pkg/, and their formatting is not ours to enforce.
-        run: zig fmt --check build.zig src examples
+        run: zig fmt --check build.zig src examples packaging/consumer
 
       - name: Build
         run: zig build
@@ -44,6 +44,22 @@ jobs:
         # Built but not run: timings from a shared runner are too noisy to
         # assert on, but the code should still be kept compiling.
         run: zig build bench-build
+
+  package:
+    name: consumable as a dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Verify the published package
+        # Building here proves nothing about building *from* here: a consumer
+        # gets only the files `paths` lists and runs build.zig as a dependency.
+        # This fetches a tarball of HEAD into a throwaway project and calls it.
+        run: ./packaging/verify.sh
 
   interop:
     name: grpc-go interop

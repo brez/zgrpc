@@ -17,7 +17,30 @@ zig build bench             # loopback latency baseline, plus pool under load
 zig build bench-build       # compile the benchmark without running it
 zig build test-integration-build   # compile integration tests without running
 ./interop/run.sh            # grpc-go interop suite (requires Go)
+./packaging/verify.sh       # fetch and use it as a published dependency
 ```
+
+## Installing
+
+```
+zig fetch --save "git+https://github.com/brez/zgrpc#v0.1.0"
+```
+
+```zig
+const zgrpc_dep = b.dependency("zgrpc", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("zgrpc", zgrpc_dep.module("zgrpc"));
+```
+
+Zig 0.16.0. The only transitive dependency is `hendriknielaender/http2.zig`,
+for its frame codec and HPACK. There is deliberately no protobuf dependency:
+this library moves `[]const u8`, and codegen sits above it, so a consumer that
+wants generated types depends on `Arwalk/zig-protobuf` itself rather than
+inheriting a pin from here.
+
+`packaging/verify.sh` checks that all of this actually holds — it packs the
+working tree the way a git ref would, fetches it into a throwaway project, and
+makes real calls. Building in this repo does not prove a consumer can build
+against it, so CI runs that separately.
 
 ## Using it
 
@@ -448,6 +471,19 @@ benchmarking rather than by a test — see "What concurrency cost": wakeups spen
 three to a call, and a per-stream receive buffer that compacted on every read
 and so was quadratic in message size.
 
+## Versioning
+
+**v0.1.0.** Semantic versioning, with 0.x meaning the public API may still
+change: while there is one consumer, an awkward API is worth breaking rather
+than living with. Breaks will be in the release notes and the reason will be
+given.
+
+What is stable enough to depend on is the wire behaviour — everything the
+grpc-go interop suite covers is a compatibility test, and those thirteen checks
+are what a bump has to keep passing. The Zig-side shapes most likely to move
+are the ones with only one consumer so far: `Pool`'s options, and how a handler
+learns about cancellation.
+
 ## Layout
 
 ```
@@ -464,6 +500,7 @@ src/integration_test.zig end-to-end tests over loopback
 examples/echo_server.zig standalone server (interop target)
 examples/bench.zig       loopback latency baseline
 interop/                 grpc-go interop suite
+packaging/               proof that it works as a published dependency
 ```
 
 ## License

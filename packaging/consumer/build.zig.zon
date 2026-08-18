@@ -1,0 +1,14 @@
+.{
+    .name = .consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x705b37274d144052,
+    .minimum_zig_version = "0.16.0",
+    // Filled in by `packaging/verify.sh`, which points this at a tarball built
+    // from the working tree. Pinning a hash here would go stale every commit.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

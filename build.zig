@@ -4,7 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
     const http2_dep = b.dependency("http2", .{ .target = target, .optimize = optimize });
 
     const mod = b.addModule("zgrpc", .{
@@ -12,10 +11,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
             .{ .name = "http2", .module = http2_dep.module("http2") },
         },
     });
+
+    // Everything past here exists to develop zgrpc, not to use it. A project
+    // that depends on this package wants the module and nothing else, and the
+    // published package does not ship `examples/` or `interop/` at all — so
+    // configuring steps whose sources are absent would be pointless at best.
+    if (b.pkg_hash.len != 0) return;
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -28,7 +32,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
                 .{ .name = "http2", .module = http2_dep.module("http2") },
             },
         }),

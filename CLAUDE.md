@@ -95,6 +95,7 @@ consumer to validate the abstractions against:
    error/status code mapping, deadline propagation, basic connection pool.
 5. **Publish as a versioned dependency** once the API is stable enough for
    the TSDB repo to depend on it via git ref instead of a local path.
+   *(Done: v0.1.0.)*
 
 ## Open questions
 
@@ -113,9 +114,11 @@ consumer to validate the abstractions against:
 - `zig build test` — unit + integration tests
 - `zig build test-unit` — pure unit tests only (no sockets)
 - `zig build test-integration` — real client/server over loopback
-- `zig build bench` — loopback latency baseline (NOT the milestone-2 number)
+- `zig build bench` — loopback latency baseline (NOT the milestone-2 number),
+  plus pool throughput under load
 - `zig build bench-build` / `zig build test-integration-build` — compile only
 - `./interop/run.sh` — grpc-go interop suite; requires Go
+- `./packaging/verify.sh` — fetch and use zgrpc as a published dependency
 
 ## Decisions made
 
@@ -129,8 +132,13 @@ rationale in README.md. Note the dependency's own `zig build` fails on its
 BoringSSL TLS targets; the `http2` module itself is BoringSSL-free.
 
 **Public API shape**: handlers take and return `[]const u8`, with a
-`CallContext` carrying the per-call arena, path, deadline and settable status.
-Protobuf codegen sits above the transport rather than inside it.
+`CallContext` carrying the per-call arena, io, path, deadline and settable
+status. Protobuf codegen sits above the transport rather than inside it — and
+as of v0.1.0 zgrpc has **no protobuf dependency at all**. It was wired into
+every module in build.zig and imported nowhere; a consumer that wants generated
+types depends on `Arwalk/zig-protobuf` directly rather than inheriting our pin.
+The pinning notes above still apply to that consumer, which is why they stay
+here.
 
 **Concurrency model**: a unit of concurrency per connection, per connection a
 reader task that owns the read side, and per stream a task running the call.
@@ -179,7 +187,13 @@ arrival, so `stream.send` fails at the next message whatever the flow-control
 window is doing. Verified by an integration test in which the handler is parked
 with a wide-open window.
 
-Milestone 4 is done. Still open: the milestone-2 in-VPC benchmark numbers, and
-a clean loopback re-measurement — every number recorded since the concurrency
-work was taken on a loaded machine, so only ratios are trustworthy. Then
-milestone 5, publishing as a versioned dependency.
+**Milestone 5 (publishing) is done** at v0.1.0. `packaging/verify.sh` is the
+thing to keep working: it packs HEAD the way a git ref would, fetches it into a
+throwaway project and makes real calls, because building *in* this repo proves
+nothing about building *against* it — a consumer gets only what `paths` lists
+and runs build.zig as a dependency, not as root. Dev-only build steps sit
+behind `if (b.pkg_hash.len != 0) return;` for the same reason. CI runs it.
+
+Still open: the milestone-2 in-VPC benchmark numbers, and a clean loopback
+re-measurement — every number recorded since the concurrency work was taken on
+a loaded machine, so only ratios are trustworthy.
