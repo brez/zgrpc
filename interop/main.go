@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -321,6 +322,53 @@ func main() {
 
 		if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
 			return fmt.Errorf("%d concurrent calls took %v; served sequentially", concurrency, elapsed)
+		}
+		return nil
+	}())
+
+	// 12. grpc-go picks its own units for `grpc-timeout` — it sends whatever
+	//     of "n", "u", "m", "S"… fits the remaining time — so decoding what
+	//     *it* sends is a different check from decoding what we send.
+	check("grpc-timeout from grpc-go arrives as a usable deadline", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := call(ctx, "/zgrpc.test.Echo/DeadlineReport", nil)
+		if err != nil {
+			return err
+		}
+		if string(resp) == "none" {
+			return errors.New("server saw no deadline")
+		}
+		left, convErr := strconv.Atoi(string(resp))
+		if convErr != nil {
+			return fmt.Errorf("unparseable reply %q", resp)
+		}
+		if left <= 0 || left > 2000 {
+			return fmt.Errorf("server reported %dms left of a 2000ms deadline", left)
+		}
+		return nil
+	}())
+
+	// 13. A call that outruns its deadline. The handler sleeps 300ms against a
+	//     100ms deadline, so the status must be DeadlineExceeded and it must
+	//     arrive without waiting out the handler.
+	check("a call past its deadline fails with DEADLINE_EXCEEDED", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		started := time.Now()
+		_, err := call(ctx, "/zgrpc.test.Echo/Slow", []byte("too slow"))
+		elapsed := time.Since(started)
+
+		st, ok := status.FromError(err)
+		if !ok {
+			return fmt.Errorf("not a grpc status: %v", err)
+		}
+		if st.Code() != codes.DeadlineExceeded {
+			return fmt.Errorf("code = %v, want DeadlineExceeded", st.Code())
+		}
+		if elapsed > 250*time.Millisecond {
+			return fmt.Errorf("took %v; waited for the handler rather than the deadline", elapsed)
 		}
 		return nil
 	}())

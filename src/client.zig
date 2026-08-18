@@ -20,6 +20,11 @@ const Code = status.Code;
 /// frame.
 const recv_chunk = h2.default_max_frame_size;
 
+/// Deadlines are measured on a clock that does not move when the system clock
+/// is adjusted. A call given five seconds must not become a call given an hour
+/// because NTP stepped backwards.
+const deadline_clock: std.Io.Clock = .awake;
+
 pub const Options = struct {
     max_message_bytes: u32 = framing.default_max_message_bytes,
     io_buffer_bytes: usize = 64 * 1024,
@@ -28,7 +33,16 @@ pub const Options = struct {
 };
 
 pub const CallOptions = struct {
-    /// Propagated to the server as `grpc-timeout`.
+    /// How long the call may take, in nanoseconds from now.
+    ///
+    /// Sent to the server as `grpc-timeout` *and* enforced locally: every wait
+    /// the call makes is bounded by it, and it fails with
+    /// `error.DeadlineExceeded` once it passes. Local enforcement is the half
+    /// that matters — a server that has hung, or one that ignores the header,
+    /// must not be able to hang the caller.
+    ///
+    /// Distinct from a `.deadline_exceeded` status in a `Response`, which is
+    /// the server reporting that *it* gave up.
     deadline_ns: ?u64 = null,
 };
 
@@ -249,6 +263,8 @@ pub const Client = struct {
         call_options: CallOptions,
     ) !Response {
         const stream = try self.sendRequest(path, request, call_options);
+        // Cancels the call on the way out if it did not finish, which for a
+        // deadline that expired is exactly what should reach the server.
         defer self.conn.closeStream(stream);
         return self.readResponse(stream);
     }
@@ -289,10 +305,19 @@ pub const Client = struct {
         call_options: CallOptions,
     ) !*h2.Stream {
         var timeout_buf: [16]u8 = undefined;
-        const timeout_text: ?[]const u8 = if (call_options.deadline_ns) |ns|
-            try timeout.encode(&timeout_buf, ns)
-        else
-            null;
+        var timeout_text: ?[]const u8 = null;
+        var deadline: ?std.Io.Clock.Timestamp = null;
+
+        if (call_options.deadline_ns) |ns| {
+            timeout_text = try timeout.encode(&timeout_buf, ns);
+            // Started here rather than after the handshake or the write: the
+            // caller asked for a call that takes no longer than this, and
+            // every part of it counts, including finding a stream to run on.
+            deadline = .fromNow(self.io, .{
+                .raw = .fromNanoseconds(@intCast(ns)),
+                .clock = deadline_clock,
+            });
+        }
 
         var fields: [8]h2.Header = undefined;
         var n: usize = 0;
@@ -316,7 +341,7 @@ pub const Client = struct {
             n += 1;
         }
 
-        const stream = try self.conn.openStream(fields[0..n], false);
+        const stream = try self.conn.openStream(fields[0..n], false, deadline);
         errdefer self.conn.closeStream(stream);
 
         // Frame the request into one buffer so headers and body leave in as

@@ -113,6 +113,61 @@ pub const error_code_frame_size_error: u32 = 0x6;
 pub const error_code_refused_stream: u32 = 0x7;
 pub const error_code_cancel: u32 = 0x8;
 
+/// A condition variable whose waits can be bounded by a deadline.
+///
+/// `std.Io.Condition` has no timed wait, and a deadline that only takes effect
+/// the next time a frame happens to arrive is not a deadline — it is a hope.
+/// This is the same idea in its simplest form: a counter every wake bumps, and
+/// waiters futex on it. Spurious wakeups are allowed, because every caller
+/// re-checks its own predicate under the mutex regardless; the bookkeeping
+/// `std.Io.Condition` does to avoid them is precisely what is not needed here.
+const Signal = struct {
+    /// Bumped by every `wake`. A waiter sleeps only while this still reads
+    /// what it read under the mutex, which is what makes a wake between the
+    /// two impossible to miss.
+    seq: std.atomic.Value(u32) = .init(0),
+    /// Guarded by the caller's mutex; lets `wake` skip the syscall when there
+    /// is nobody to wake, which on this path is the common case.
+    waiters: u32 = 0,
+
+    /// Caller must hold `mutex`, and must re-check its predicate afterwards:
+    /// this returns on a wake, on `timeout`, or for no reason at all.
+    fn wait(
+        self: *Signal,
+        io: std.Io,
+        mutex: *std.Io.Mutex,
+        timeout: std.Io.Timeout,
+    ) std.Io.Cancelable!void {
+        const observed = self.seq.load(.monotonic);
+        self.waiters += 1;
+        mutex.unlock(io);
+
+        defer {
+            mutex.lockUncancelable(io);
+            self.waiters -= 1;
+        }
+        try io.futexWaitTimeout(u32, &self.seq.raw, observed, timeout);
+    }
+
+    /// Wakes every waiter. Caller must hold the same mutex, so that a wake
+    /// cannot slip between a waiter's predicate check and its sleep.
+    fn wake(self: *Signal, io: std.Io) void {
+        _ = self.seq.fetchAdd(1, .monotonic);
+        if (self.waiters == 0) return;
+        io.futexWake(u32, &self.seq.raw, std.math.maxInt(u32));
+    }
+};
+
+/// Whether `deadline` has passed. No deadline never passes.
+fn expired(io: std.Io, deadline: ?std.Io.Clock.Timestamp) bool {
+    const at = deadline orelse return false;
+    return at.durationFromNow(io).raw.nanoseconds <= 0;
+}
+
+fn timeoutFor(deadline: ?std.Io.Clock.Timestamp) std.Io.Timeout {
+    return if (deadline) |at| .{ .deadline = at } else .none;
+}
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -173,8 +228,13 @@ pub const Stream = struct {
     conn: *Connection,
     id: u32,
 
-    /// Signalled by the reader whenever something arrives for this stream.
-    ready: std.Io.Condition = .init,
+    /// Woken by the reader whenever something arrives for this stream.
+    ready: Signal = .{},
+
+    /// When this call must be over, on the `.awake` clock. Every wait on this
+    /// stream is bounded by it, which is what makes it a deadline rather than
+    /// a note in a header. Null means no deadline.
+    deadline: ?std.Io.Clock.Timestamp = null,
 
     /// Decoded header blocks awaiting collection, each tagged with how many
     /// stream bytes had arrived before it. That tag is what keeps a header
@@ -292,7 +352,13 @@ pub const Stream = struct {
                 if (self.ended) break :blk Event.end;
                 if (conn.closed) return conn.closeReason();
 
-                try self.ready.wait(io, &conn.mutex);
+                // Checked after the mailbox, not before: a reply that landed
+                // in the same breath as the deadline is still a reply, and
+                // failing a call whose answer is already in hand would be
+                // gratuitous.
+                if (expired(io, self.deadline)) return error.DeadlineExceeded;
+
+                try self.ready.wait(io, &conn.mutex, timeoutFor(self.deadline));
             }
         };
 
@@ -314,6 +380,24 @@ pub const Stream = struct {
         }
         self.recv.shrinkRetainingCapacity(remaining);
         self.recv_pos = 0;
+    }
+
+    /// Sets when this call must be over. The server learns its deadline from
+    /// the request headers, so it cannot be supplied when the stream is
+    /// created the way a client's can.
+    pub fn setDeadline(self: *Stream, deadline: ?std.Io.Clock.Timestamp) void {
+        const io = self.conn.io;
+        self.conn.mutex.lockUncancelable(io);
+        defer self.conn.mutex.unlock(io);
+        self.deadline = deadline;
+    }
+
+    /// True once this stream's deadline has passed.
+    pub fn isExpired(self: *Stream) bool {
+        const io = self.conn.io;
+        self.conn.mutex.lockUncancelable(io);
+        defer self.conn.mutex.unlock(io);
+        return expired(io, self.deadline);
     }
 
     /// True once the peer has reset this stream. Cheap enough to check before
@@ -344,14 +428,14 @@ pub const Connection = struct {
     /// Serialises stream creation so ids go out in ascending order.
     open_mutex: std.Io.Mutex = .init,
 
-    /// Signalled when send credit appears, or when a stream or the connection
-    /// dies while someone is waiting for credit.
-    flow: std.Io.Condition = .init,
-    /// Signalled when a peer-initiated stream is queued for `accept`.
-    accept_ready: std.Io.Condition = .init,
-    /// Signalled when a locally-initiated stream closes, freeing a slot under
-    /// the peer's SETTINGS_MAX_CONCURRENT_STREAMS.
-    stream_slots: std.Io.Condition = .init,
+    /// Woken when send credit appears, or when a stream or the connection dies
+    /// while someone is waiting for credit.
+    flow: Signal = .{},
+    /// Woken when a peer-initiated stream is queued for `accept`.
+    accept_ready: Signal = .{},
+    /// Woken when a locally-initiated stream closes, freeing a slot under the
+    /// peer's SETTINGS_MAX_CONCURRENT_STREAMS.
+    stream_slots: Signal = .{},
 
     /// Separate HPACK contexts per direction: each endpoint keeps its own
     /// encoder table, and they must not be shared. `encode_table` belongs to
@@ -498,10 +582,10 @@ pub const Connection = struct {
         // Everyone waiting on anything has to be told, or a caller blocked on
         // a stream that will never see another frame waits forever.
         var it = self.streams.valueIterator();
-        while (it.next()) |stream| stream.*.ready.broadcast(io);
-        self.flow.broadcast(io);
-        self.accept_ready.broadcast(io);
-        self.stream_slots.broadcast(io);
+        while (it.next()) |stream| stream.*.ready.wake(io);
+        self.flow.wake(io);
+        self.accept_ready.wake(io);
+        self.stream_slots.wake(io);
     }
 
     // -- streams -----------------------------------------------------------
@@ -515,6 +599,7 @@ pub const Connection = struct {
         self: *Connection,
         headers: []const Header,
         end_stream: bool,
+        deadline: ?std.Io.Clock.Timestamp,
     ) !*Stream {
         const io = self.io;
         try self.open_mutex.lock(io);
@@ -535,7 +620,8 @@ pub const Connection = struct {
             while (self.local_streams >= limit) {
                 if (self.closed) return self.closeReason();
                 if (self.goaway_received != null) return error.ConnectionClosed;
-                try self.stream_slots.wait(io, &self.mutex);
+                if (expired(io, deadline)) return error.DeadlineExceeded;
+                try self.stream_slots.wait(io, &self.mutex, timeoutFor(deadline));
             }
 
             if (self.closed) return self.closeReason();
@@ -543,7 +629,12 @@ pub const Connection = struct {
 
             const id = self.next_stream_id;
             self.next_stream_id += 2;
-            stream.* = .{ .conn = self, .id = id, .send_window = self.peer_initial_window };
+            stream.* = .{
+                .conn = self,
+                .id = id,
+                .send_window = self.peer_initial_window,
+                .deadline = deadline,
+            };
             try self.streams.put(self.allocator, id, stream);
             self.local_streams += 1;
         }
@@ -570,7 +661,7 @@ pub const Connection = struct {
                 return null;
             }
             if (self.goaway_received != null) return null;
-            try self.accept_ready.wait(io, &self.mutex);
+            try self.accept_ready.wait(io, &self.mutex, .none);
         }
     }
 
@@ -612,7 +703,7 @@ pub const Connection = struct {
         const locally_opened = if (self.is_server) id % 2 == 0 else id % 2 == 1;
         if (locally_opened) {
             self.local_streams -= 1;
-            self.stream_slots.signal(io);
+            self.stream_slots.wake(io);
         }
     }
 
@@ -825,8 +916,12 @@ pub const Connection = struct {
                     return n;
                 }
 
+                // A peer that stops granting credit is the other way a call
+                // can hang forever, so the deadline has to reach here too.
+                if (expired(io, stream.deadline)) return error.DeadlineExceeded;
+
                 if (flushed) {
-                    try self.flow.wait(io, &self.mutex);
+                    try self.flow.wait(io, &self.mutex, timeoutFor(stream.deadline));
                     continue;
                 }
             }
@@ -886,16 +981,16 @@ pub const Connection = struct {
         defer self.mutex.unlock(io);
 
         for (self.pending_wakes.items) |id| {
-            if (self.streams.get(id)) |stream| stream.ready.broadcast(io);
+            if (self.streams.get(id)) |stream| stream.ready.wake(io);
         }
         self.pending_wakes.clearRetainingCapacity();
 
         if (self.wake_accept) {
-            self.accept_ready.broadcast(io);
+            self.accept_ready.wake(io);
             self.wake_accept = false;
         }
         if (self.wake_flow) {
-            self.flow.broadcast(io);
+            self.flow.wake(io);
             self.wake_flow = false;
         }
     }

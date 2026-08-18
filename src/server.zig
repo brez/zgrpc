@@ -29,6 +29,10 @@ const Code = status.Code;
 /// frame, so a full DATA frame is handed over in one go.
 const recv_chunk = h2.default_max_frame_size;
 
+/// Deadlines are measured on a clock that does not move when the system clock
+/// is adjusted; see `client.deadline_clock`.
+const deadline_clock: std.Io.Clock = .awake;
+
 /// Everything a handler learns about the call in progress.
 pub const CallContext = struct {
     /// Per-call arena. Anything the handler allocates from this — including
@@ -41,8 +45,20 @@ pub const CallContext = struct {
     io: std.Io,
     /// Full method path, e.g. `/helloworld.Greeter/SayHello`.
     path: []const u8,
-    /// Client deadline in nanoseconds from call start, if `grpc-timeout` was sent.
-    deadline_ns: ?u64,
+    /// When this call must be over, if the client sent `grpc-timeout`.
+    ///
+    /// The transport enforces this wherever it blocks on the client's behalf:
+    /// reading the request, and `ServerStream.send`. What it cannot do is
+    /// interrupt the handler's own work — there is no way to preempt a
+    /// function — so a handler that does something slow should bound it with
+    /// `deadlineTimeout` or check `expired`.
+    ///
+    /// Measured from when the request headers were read, not from when the
+    /// client sent them: `grpc-timeout` is a duration, and the time it spent
+    /// in flight is not knowable without synchronised clocks. The server's
+    /// deadline is therefore always a little later than the client's, which is
+    /// the safe direction to be wrong in.
+    deadline: ?std.Io.Clock.Timestamp = null,
     request_headers: *const h2.Headers,
 
     /// Status returned to the client. A handler that wants to fail with a
@@ -52,6 +68,25 @@ pub const CallContext = struct {
     pub fn fail(self: *CallContext, code: Code, message: []const u8) error{HandlerFailed} {
         self.status = .{ .code = code, .message = message };
         return error.HandlerFailed;
+    }
+
+    /// Time left, or null if the client set no deadline. Negative once it has
+    /// passed.
+    pub fn remaining(self: *const CallContext) ?std.Io.Duration {
+        const at = self.deadline orelse return null;
+        return at.durationFromNow(self.io).raw;
+    }
+
+    pub fn expired(self: *const CallContext) bool {
+        const left = self.remaining() orelse return false;
+        return left.nanoseconds <= 0;
+    }
+
+    /// The deadline in the form any `Io` call that accepts one will take, so a
+    /// handler can hand its own work the same limit the call has.
+    pub fn deadlineTimeout(self: *const CallContext) std.Io.Timeout {
+        const at = self.deadline orelse return .none;
+        return .{ .deadline = at };
     }
 };
 
@@ -115,15 +150,20 @@ pub const ServerStream = struct {
 
     /// Sends one message. `message` is not retained.
     ///
-    /// Returns `error.StreamReset` once the client has cancelled, which
-    /// unwinds the handler and stops it producing. Handlers that loop over a
-    /// large result set get this for free from `try stream.send(...)`.
+    /// Returns `error.StreamReset` once the client has cancelled, or
+    /// `error.DeadlineExceeded` once the call's deadline has passed. Either
+    /// unwinds the handler and stops it producing; handlers that loop over a
+    /// large result set get both for free from `try stream.send(...)`.
     ///
     /// The check is against state the connection's reader task has already
     /// recorded, so it reflects a RST_STREAM that arrived at any point — not
     /// only one noticed because this write happened to block.
     pub fn send(self: *ServerStream, message: []const u8) !void {
         if (self.stream.isReset()) return error.StreamReset;
+        // Checked per message so a handler looping over a large result set
+        // stops at the deadline, rather than only when the transport next
+        // happens to block.
+        if (self.stream.isExpired()) return error.DeadlineExceeded;
 
         if (!self.headers_sent) {
             try self.conn.writeHeaders(self.stream.id, &.{
@@ -334,6 +374,7 @@ pub const Server = struct {
             error.ConnectionClosed,
             error.EndOfStream,
             error.Canceled,
+            error.DeadlineExceeded,
             => {},
             else => log.warn("call failed: {t}", .{err}),
         };
@@ -369,10 +410,20 @@ pub const Server = struct {
             return;
         };
 
-        const deadline_ns: ?u64 = if (headers.get("grpc-timeout")) |t|
-            timeout.decode(t) catch null
-        else
-            null;
+        // The clock starts here, on the first thing the server does with the
+        // call, so that everything after it is inside the budget.
+        const deadline: ?std.Io.Clock.Timestamp = deadline: {
+            const text = headers.get("grpc-timeout") orelse break :deadline null;
+            // A `grpc-timeout` we cannot parse is not a reason to fail the
+            // call; it is a reason to treat it as unbounded, which is what a
+            // client that sent no timeout would have got.
+            const ns = timeout.decode(text) catch break :deadline null;
+            break :deadline .fromNow(self.io, .{
+                .raw = .fromNanoseconds(@intCast(ns)),
+                .clock = deadline_clock,
+            });
+        };
+        stream.setDeadline(deadline);
 
         // END_STREAM on the HEADERS frame means a zero-length request, which
         // is legal.
@@ -380,7 +431,11 @@ pub const Server = struct {
         if (!headers.end_stream) {
             request_bytes = self.readRequestMessage(stream, &decoder, call_arena.allocator()) catch |err| {
                 try self.respondStatusOnly(conn, stream.id, .{
-                    .code = if (err == error.MessageTooLarge) .resource_exhausted else .internal,
+                    .code = switch (err) {
+                        error.MessageTooLarge => .resource_exhausted,
+                        error.DeadlineExceeded => .deadline_exceeded,
+                        else => .internal,
+                    },
                     .message = @errorName(err),
                 });
                 return;
@@ -399,7 +454,7 @@ pub const Server = struct {
             .allocator = call_arena.allocator(),
             .io = self.io,
             .path = path,
-            .deadline_ns = deadline_ns,
+            .deadline = deadline,
             .request_headers = &headers,
         };
 
@@ -415,6 +470,14 @@ pub const Server = struct {
                     return;
                 }
 
+                // A handler that overran its deadline has produced an answer
+                // nobody is waiting for: the client's own clock fired first,
+                // since it started earlier. Say so rather than pretend.
+                if (ctx.expired()) {
+                    try self.respondStatusOnly(conn, stream.id, deadline_status);
+                    return;
+                }
+
                 try self.respond(conn, stream, response, Status.ok);
             },
 
@@ -427,7 +490,8 @@ pub const Server = struct {
                 defer out.deinit();
 
                 if (call(&ctx, request_bytes, &out)) |_| {
-                    try self.finishStream(conn, stream, &out, ctx.status);
+                    const final = if (ctx.expired() and ctx.status.isOk()) deadline_status else ctx.status;
+                    try self.finishStream(conn, stream, &out, final);
                 } else |err| {
                     // A client that cancelled has already torn the stream down.
                     // There is nothing to report to and nothing to report — it
@@ -493,11 +557,15 @@ pub const Server = struct {
         }
     }
 
-    /// A handler that set an explicit status keeps it; anything else is an
-    /// unexpected failure and maps to INTERNAL.
+    const deadline_status: Status = .{ .code = .deadline_exceeded, .message = "deadline exceeded" };
+
+    /// A handler that set an explicit status keeps it. A deadline is not an
+    /// unexpected failure and gets its own code; anything else maps to
+    /// INTERNAL.
     fn failureStatus(ctx: *const CallContext, err: anyerror) Status {
-        if (ctx.status.isOk()) return .{ .code = .internal, .message = @errorName(err) };
-        return ctx.status;
+        if (!ctx.status.isOk()) return ctx.status;
+        if (err == error.DeadlineExceeded) return deadline_status;
+        return .{ .code = .internal, .message = @errorName(err) };
     }
 
     fn lookup(self: *Server, path: []const u8) ?Handler {

@@ -107,8 +107,53 @@ fn cancelProbeHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgr
 const rendezvous_path = "/zgrpc.test.Echo/Rendezvous";
 const cancel_probe_path = "/zgrpc.test.Echo/CancelProbe";
 
+/// Reports how many milliseconds the call has left, so a test can see that
+/// `grpc-timeout` survived the round trip as something the handler can act on.
+fn deadlineReportHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    const left = ctx.remaining() orelse return ctx.allocator.dupe(u8, "none");
+    return std.fmt.allocPrint(ctx.allocator, "{d}", .{@divTrunc(left.nanoseconds, std.time.ns_per_ms)});
+}
+
+/// Overruns any deadline a test sets, without checking for one.
+fn slowHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    try std.Io.sleep(ctx.io, .fromMilliseconds(1000), .awake);
+    return ctx.allocator.dupe(u8, request);
+}
+
+/// What ended `stalledStreamHandler`: 0 still running, 1 its deadline, 2
+/// cancellation, 3 something else, 4 nothing — it ran to completion.
+var stalled_outcome: std.atomic.Value(u8) = .init(0);
+
+/// Streams more than any flow-control window will hold, so it blocks for
+/// credit as soon as the client stops reading.
+fn stalledStreamHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = request;
+    const chunk = try ctx.allocator.alloc(u8, 64 * 1024);
+    @memset(chunk, 'x');
+
+    for (0..64) |_| {
+        stream.send(chunk) catch |err| {
+            stalled_outcome.store(switch (err) {
+                error.DeadlineExceeded => 1,
+                error.StreamReset => 2,
+                else => 3,
+            }, .release);
+            return err;
+        };
+    }
+    stalled_outcome.store(4, .release);
+}
+
+const deadline_report_path = "/zgrpc.test.Echo/DeadlineReport";
+const slow_path = "/zgrpc.test.Echo/Slow";
+const stalled_path = "/zgrpc.test.Echo/Stalled";
+
 const methods = [_]zgrpc.Method{
     zgrpc.Method.unary(echo_path, echoHandler),
+    zgrpc.Method.unary(deadline_report_path, deadlineReportHandler),
+    zgrpc.Method.unary(slow_path, slowHandler),
+    zgrpc.Method.serverStream(stalled_path, stalledStreamHandler),
     zgrpc.Method.unary(fail_path, failHandler),
     zgrpc.Method.unary(rendezvous_path, rendezvousHandler),
     zgrpc.Method.serverStream(count_path, countHandler),
@@ -282,14 +327,87 @@ test "deadline is propagated to the server as grpc-timeout" {
         allocator.free(pair.authority);
     }
 
-    // The echo handler reports whether it saw a deadline.
-    var response = try pair.client.call(echo_path, "deadline", .{
-        .deadline_ns = 5 * std.time.ns_per_ms,
+    var response = try pair.client.call(deadline_report_path, "", .{
+        .deadline_ns = 5 * std.time.ns_per_s,
     });
     defer response.deinit();
 
     try testing.expectEqual(zgrpc.Code.ok, response.call_status.code);
-    try testing.expectEqualStrings("deadline", response.message);
+
+    // The handler reports the time it has left. That it is positive and no
+    // more than what was asked for is the whole claim: `grpc-timeout` was
+    // encoded, sent, decoded, and turned into a clock the handler can read.
+    const left_ms = try std.fmt.parseInt(i64, response.message, 10);
+    try testing.expect(left_ms > 0);
+    try testing.expect(left_ms <= 5000);
+}
+
+test "a client stops waiting at its deadline instead of at the handler's convenience" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    const started = std.Io.Timestamp.now(io, .awake);
+    const result = pair.client.call(slow_path, "", .{ .deadline_ns = 200 * std.time.ns_per_ms });
+    const elapsed_ms = @divTrunc(
+        std.Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds,
+        std.time.ns_per_ms,
+    );
+
+    try testing.expectError(error.DeadlineExceeded, result);
+    // The handler sleeps a second. Returning in a fraction of that is the
+    // point: the deadline is the client's own, not something it discovers when
+    // the server finally answers.
+    try testing.expect(elapsed_ms < 800);
+}
+
+test "the server stops a handler at the deadline when the client has stopped reading" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    stalled_outcome.store(0, .release);
+
+    var stream = try pair.client.callServerStream(stalled_path, "", .{
+        .deadline_ns = 500 * std.time.ns_per_ms,
+    });
+    defer stream.deinit();
+
+    // One message, so the call is definitely running, and then stop reading.
+    // The server fills the flow-control window and blocks for credit that is
+    // never coming — with nothing cancelled, so only its own deadline can end
+    // it. This is the case the server-side deadline exists for: a client that
+    // has gone quiet rather than gone away.
+    const first = try stream.next();
+    try testing.expect(first != null);
+
+    try std.Io.sleep(io, .fromMilliseconds(2000), .awake);
+
+    // 2 would mean it was cancellation that stopped the handler rather than
+    // the deadline, which would make this test prove nothing.
+    try testing.expectEqual(@as(u8, 1), stalled_outcome.load(.acquire));
 }
 
 test "an empty request and response are legal" {

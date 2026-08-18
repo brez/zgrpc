@@ -6,11 +6,11 @@ Real gRPC over HTTP/2 (h2c) for Zig — actual wire protocol, verified against
 the reference `grpc-go` implementation.
 
 Status: **unary and server streaming work end to end**, concurrently, over a
-pool of persistent connections, and interoperate with grpc-go (milestones 1, 3
-and most of 4).
+pool of persistent connections, under enforced deadlines, and interoperate with
+grpc-go (milestones 1, 3 and 4).
 
 ```
-zig build test              # unit + integration tests (79)
+zig build test              # unit + integration tests (81)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency baseline, plus pool under load
@@ -52,9 +52,13 @@ Client:
 const client = try zgrpc.Client.connect(allocator, io, address, "host:50051", .{});
 defer client.deinit();
 
-var response = try client.call("/helloworld.Greeter/SayHello", request_bytes, .{
+var response = client.call("/helloworld.Greeter/SayHello", request_bytes, .{
     .deadline_ns = 5 * std.time.ns_per_ms,
-});
+}) catch |err| switch (err) {
+    // The call's own clock ran out. See "Deadlines".
+    error.DeadlineExceeded => return,
+    else => return err,
+};
 defer response.deinit();
 
 if (!response.call_status.isOk()) { /* response.call_status.code / .message */ }
@@ -337,6 +341,49 @@ left to finish, and it is closed when the last one does. Nothing is retried —
 the call in flight when a connection dies fails, and it is the caller's
 business whether to try again.
 
+## Deadlines
+
+`CallOptions.deadline_ns` is sent to the server as `grpc-timeout` and enforced
+locally. Local enforcement is the half that matters: a server that has hung,
+or one that ignores the header, must not be able to hang the caller. Every
+point where a call waits is bounded by it — finding a stream to run on, waiting
+for flow-control credit, waiting for the reply — and the call fails with
+`error.DeadlineExceeded`.
+
+That is deliberately an error rather than a `.deadline_exceeded` status. The
+two are different facts: the error is *this* client's clock running out, and
+the status is the server reporting that it gave up. A caller that wants to
+treat them alike can, but it should have to say so.
+
+Server-side, `grpc-timeout` becomes `ctx.deadline`, and the transport enforces
+it wherever it blocks on the client's behalf — reading the request, and
+`ServerStream.send`. The clock starts when the request headers are read, not
+when the client sent them: `grpc-timeout` is a duration, and the time it spent
+in flight is not knowable without synchronised clocks. The server's deadline is
+therefore always slightly later than the client's, which is the safe direction.
+
+```zig
+fn rangeQuery(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    // Bound your own work with the same limit the call has.
+    const rows = try openCursor(ctx.allocator, request, ctx.deadlineTimeout());
+    while (try rows.next()) |row| {
+        // Fails with error.DeadlineExceeded once the deadline passes, which
+        // unwinds the handler.
+        try stream.send(row);
+    }
+}
+```
+
+What the server cannot do is interrupt a handler's own work — there is no way
+to preempt a function. A handler that spends a minute on CPU will spend a
+minute on CPU, and the client will have given up long before. `ctx.expired()`,
+`ctx.remaining()` and `ctx.deadlineTimeout()` exist so a handler that cares can
+cooperate; nothing forces it to.
+
+Deadlines are measured on a clock unaffected by system time changes, so a call
+given five seconds does not become a call given an hour because NTP stepped
+backwards.
+
 ## Known constraints
 
 **No compression.** The compressed-message flag is parsed and rejected;
@@ -347,9 +394,11 @@ connection, chosen for an in-VPC round trip and never adjusted. grpc-go
 estimates the bandwidth-delay product and grows its windows to match; a link
 much faster or much slower than assumed will not get the same treatment here.
 
-**No deadline enforcement on the server.** `grpc-timeout` is decoded and handed
-to the handler as `ctx.deadline_ns`, but nothing cancels a handler that runs
-past it. Handlers that care must check it themselves.
+**Deadlines bound waiting, not working.** Every wait a call makes is bounded,
+but a handler burning CPU cannot be preempted, and two waits sit outside the
+mechanism: establishing a connection, and a socket write to a peer that has
+granted HTTP/2 credit but stopped draining its TCP receive buffer. Both need
+timeouts the `Io` interface does not offer for those operations.
 
 **A pool is one peer.** Every connection goes to the same address. Spreading
 calls over several peers is load balancing, which needs name resolution and a
@@ -372,9 +421,11 @@ the unary happy path, empty messages, messages spanning many DATA frames and
 exceeding the flow-control window, non-OK status codes with messages, unknown
 methods, connection reuse across calls, server streaming — ordered delivery,
 empty streams, long streams, and a mid-stream failure whose status must arrive
-in trailers after the messages already sent — and eight concurrent RPCs
-multiplexed over the one connection grpc-go keeps open, timed to prove they
-overlap rather than queue.
+in trailers after the messages already sent — eight concurrent RPCs multiplexed
+over the one connection grpc-go keeps open, timed to prove they overlap rather
+than queue, and deadlines in both directions: a `grpc-timeout` of grpc-go's own
+choosing decoded into a usable budget, and a call that outruns one failing with
+DEADLINE_EXCEEDED without waiting out the handler.
 
 Bugs found this way that the internal tests missed:
 

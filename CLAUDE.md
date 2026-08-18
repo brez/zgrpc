@@ -157,6 +157,18 @@ callers on loopback (`zig build bench`, "under load"), which is where the
 default came from — re-measure on the target host, since the useful ceiling
 tracks cores.
 
+**Deadlines are enforced, not just propagated.** `CallOptions.deadline_ns` goes
+out as `grpc-timeout` and bounds every wait the call makes on both sides
+(finding a stream, flow-control credit, waiting for frames), failing with
+`error.DeadlineExceeded` — deliberately an error rather than a
+`.deadline_exceeded` status, which means the *server* gave up. Needed a small
+`Signal` type in h2.zig, because `std.Io.Condition` has no timed wait and
+`futexWaitTimeout` does; measured no latency cost against the conditions it
+replaced. Server clock starts at header receipt, on `.awake` so NTP cannot
+extend a call. What is not covered: a handler burning CPU (no preemption),
+connection establishment, and a socket write to a peer that grants HTTP/2
+credit but stops draining TCP.
+
 **Server streaming (milestone 3) is done**: `Method.serverStream` +
 `ServerStream.send` on the server, `callServerStream` + `ResponseStream.next`
 on the client, verified against grpc-go. Messages are not buffered whole at
@@ -167,8 +179,7 @@ arrival, so `stream.send` fails at the next message whatever the flow-control
 window is doing. Verified by an integration test in which the handler is parked
 with a wide-open window.
 
-Still open: the milestone-2 in-VPC benchmark numbers, and a clean loopback
-re-measurement — every number recorded since the concurrency work was taken on
-a loaded machine, so only ratios are trustworthy. Milestone 4 is done apart
-from server-side deadline enforcement: `grpc-timeout` is decoded and handed to
-handlers as `ctx.deadline_ns`, but nothing cancels a handler that overruns it.
+Milestone 4 is done. Still open: the milestone-2 in-VPC benchmark numbers, and
+a clean loopback re-measurement — every number recorded since the concurrency
+work was taken on a loaded machine, so only ratios are trustworthy. Then
+milestone 5, publishing as a versioned dependency.

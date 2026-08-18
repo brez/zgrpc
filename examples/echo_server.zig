@@ -27,6 +27,14 @@ fn count(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStre
     }
 }
 
+/// Reports the milliseconds left on the call, so an interop client can check
+/// that the `grpc-timeout` it chose to send arrived as a usable deadline.
+fn deadlineReport(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    const left = ctx.remaining() orelse return ctx.allocator.dupe(u8, "none");
+    return std.fmt.allocPrint(ctx.allocator, "{d}", .{@divTrunc(left.nanoseconds, std.time.ns_per_ms)});
+}
+
 /// Echoes after a fixed pause, so a caller can tell concurrent handling from
 /// sequential handling by the clock: N of these at once should take about as
 /// long as one, not N times as long.
@@ -48,6 +56,7 @@ const methods = [_]zgrpc.Method{
     zgrpc.Method.unary("/zgrpc.test.Echo/Call", echo),
     zgrpc.Method.unary("/zgrpc.test.Echo/Fail", fail),
     zgrpc.Method.unary("/zgrpc.test.Echo/Slow", slow),
+    zgrpc.Method.unary("/zgrpc.test.Echo/DeadlineReport", deadlineReport),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/Count", count),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/CountThenFail", countThenFail),
 };
