@@ -151,7 +151,7 @@ header blocks are decoded only on its reader task — upstream's HPACK scratch
 buffer is `threadlocal` (not process-wide, as previously recorded here), so
 concurrency across connections is safe and interleaving within one is not.
 Measured cost: about 11us of p50 per call for the thread handoff, against a
-~5ms budget. Full numbers and the two bugs it flushed out in README "Latency".
+~5ms budget. Full numbers and the two bugs it flushed out in docs/notes.md.
 
 **Flow-control windows**: 256KB per stream, 1MB per connection (raised by a
 WINDOW_UPDATE on stream 0, since SETTINGS cannot set it). Credit is returned on
@@ -164,7 +164,7 @@ a connection is opened only when every existing one is busy, so a sequential
 caller holds exactly one however high the ceiling. Idle first, then grow, then
 share the least loaded. Retired connections finish their calls before closing;
 no retries. Worth ~30% throughput and ~30% off p50 at 8 and 64 concurrent
-callers on loopback (`zig build bench`, "under load"), which is where the
+callers on loopback (`zig build bench`, "under load"; numbers in docs/notes.md), which is where the
 default came from — re-measure on the target host, since the useful ceiling
 tracks cores.
 
