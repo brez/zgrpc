@@ -51,11 +51,21 @@ consumer to validate the abstractions against:
    (1-byte compression flag + 4-byte big-endian length) + serialized
    protobuf payload, plus trailer/status handling and deadline
    (`grpc-timeout`) propagation.
-4. **Protobuf messages** — `Arwalk/zig-protobuf` for encode/decode and
-   service interface codegen from `.proto` files. Use its `StreamDecoder`
-   (zero-allocation pull parser over `std.Io.Reader`) to decode straight
-   off the HTTP/2 stream instead of buffering full messages — this matters
-   for the tail-latency budget, not just throughput.
+4. **Protobuf messages** — `Arwalk/zig-protobuf`, above the transport and not
+   a dependency of it; see "Decisions made". Two corrections to what was
+   assumed here, both checked against the v5.0.0 source:
+   - There is no `StreamDecoder`. The name appears nowhere in the package.
+     What exists is `protobuf.decode(T, reader, allocator)` over a
+     `*std.Io.Reader`, which does allocate. Decoding straight off the HTTP/2
+     stream rather than buffering the message would need something that does
+     not exist yet, so zgrpc hands handlers a complete `[]const u8`.
+   - "Service interface codegen" overstates it. protoc emits a vtable type per
+     `service` — function pointers plus `package` and `service_name`
+     constants — and zig-protobuf's own README says it is "service interfaces
+     only ... does not include a gRPC transport layer". The signatures are not
+     zgrpc's handler shape, so nothing plugs in: method paths and their types
+     are written by hand. A protoc plugin emitting zgrpc handlers is the thing
+     that would fix this.
 
 ## Dependency versions (confirmed working)
 

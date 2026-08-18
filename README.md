@@ -94,12 +94,66 @@ directly.
 Handlers take and return **bytes**, not generated types, so the same shape
 works for any codec.
 
+## Protobuf
+
+zgrpc moves `[]const u8`, and those bytes are the serialized message — so a
+`.proto` fits by generating Zig types with `protoc`, decoding at the top of the
+handler and encoding at the bottom. Add
+[zig-protobuf](https://github.com/Arwalk/zig-protobuf) yourself; codegen is a
+build step, and it downloads `protoc` for you.
+
+```zig
+// build.zig
+const protobuf = @import("protobuf");
+
+const gen = b.step("gen-proto", "generate Zig types from .proto");
+gen.dependOn(&protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+    .destination_directory = b.path("src/proto"),
+    .source_files = &.{b.path("proto/helloworld.proto")},
+    // Must contain the .proto files; protoc rejects paths it cannot see below
+    // one of these.
+    .include_directories = &.{b.path("proto")},
+}).step);
+```
+
+```zig
+const pb = @import("proto/helloworld.pb.zig");
+
+fn sayHello(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    var reader = std.Io.Reader.fixed(request);
+    const req = try pb.HelloRequest.decode(&reader, ctx.allocator);
+
+    const reply: pb.HelloReply = .{
+        .message = try std.fmt.allocPrint(ctx.allocator, "hello {s}", .{req.name}),
+    };
+
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    try reply.encode(&out.writer, ctx.allocator);
+    return out.written();
+}
+```
+
+Both allocate from `ctx.allocator`, so neither needs cleanup — the arena goes
+when the call does. Clients are the mirror image: encode the request, pass the
+bytes to `call`, decode `response.message`.
+
+**There is no stub generation.** You write the `/package.Service/Method` path
+yourself and pair it with the right request and response types by hand; nothing
+checks that you got it right. zig-protobuf does emit a vtable type per
+`service` — with `package` and `service_name` constants you can build the path
+from — but it is transport-agnostic by design (its README: "service interfaces
+only ... does not include a gRPC transport layer") and its handler signatures
+are not zgrpc's, so it is not something to plug in. Closing this properly means
+a protoc plugin that emits zgrpc handlers, which does not exist yet.
+
 ## What it does not do
 
 - **No TLS.** h2c only, and no ALPN, so it cannot talk to a TLS endpoint.
 - **No compression.** The compressed-message flag is parsed and rejected.
 - **No retries, load balancing, interceptors or name resolution.** A pool is
   several connections to *one* peer.
+- **No generated service stubs.** Message types come from protoc; method paths
+  and their types are hand-written. See [Protobuf](#protobuf).
 - **Deadlines bound waiting, not working.** Every wait a call makes is bounded,
   but a handler burning CPU cannot be preempted, and neither connecting nor a
   socket write to a peer that has stopped draining TCP is covered.
