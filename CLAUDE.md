@@ -129,6 +129,8 @@ consumer to validate the abstractions against:
 - `zig build bench-build` / `zig build test-integration-build` — compile only
 - `./interop/run.sh` — grpc-go interop suite; requires Go
 - `./packaging/verify.sh` — fetch and use zgrpc as a published dependency
+- `cd examples/protobuf && zig build run` — protobuf end to end; a standalone
+  project so that zgrpc itself keeps having no protobuf dependency
 
 ## Decisions made
 

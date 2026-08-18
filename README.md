@@ -102,6 +102,11 @@ handler and encoding at the bottom. Add
 [zig-protobuf](https://github.com/Arwalk/zig-protobuf) yourself; codegen is a
 build step, and it downloads `protoc` for you.
 
+[`examples/protobuf/`](examples/protobuf) is all of this working: a `.proto`,
+the generated types, a server and a client. It is a standalone project because
+zgrpc has no protobuf dependency and the example needs one — which is also what
+keeps that claim honest. `cd examples/protobuf && zig build run`.
+
 ```zig
 // build.zig
 const protobuf = @import("protobuf");
@@ -169,6 +174,9 @@ zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency, plus pool throughput under load
 ./interop/run.sh            # grpc-go interop suite, 13 checks (requires Go)
 ./packaging/verify.sh       # fetch and use it as a published dependency
+
+cd examples/protobuf && zig build run        # the protobuf example
+cd examples/protobuf && zig build gen-proto  # regenerate its .pb.zig
 ```
 
 `interop/` is the check that matters: our own client agreeing with our own

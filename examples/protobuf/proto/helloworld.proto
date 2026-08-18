@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package helloworld;
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+}
+
+// zgrpc does not generate stubs from this. The service block is here because a
+// real .proto has one and because protoc emits a vtable type for it; the
+// method path in main.zig is written by hand to match. See the repository
+// README, "Protobuf".
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply);
+}

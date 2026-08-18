@@ -26,9 +26,12 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Check formatting
-        # Scoped to our own sources: the build fetches dependencies into
-        # zig-pkg/, and their formatting is not ours to enforce.
-        run: zig fmt --check build.zig src examples packaging/consumer
+        # Listed rather than globbed: builds drop fetched dependencies into
+        # zig-pkg/ directories, including one under examples/protobuf/, and
+        # their formatting is not ours to enforce.
+        run: >
+          zig fmt --check build.zig src packaging/consumer
+          examples/*.zig examples/protobuf/build.zig examples/protobuf/src
 
       - name: Build
         run: zig build
@@ -39,6 +42,13 @@ jobs:
       - name: Integration tests
         # Real client/server over loopback TCP.
         run: zig build test-integration --summary all
+
+      - name: Protobuf example
+        # Its own project, because zgrpc has no protobuf dependency and this
+        # needs one. Running it here is what stops the README's protobuf
+        # snippets from rotting.
+        working-directory: examples/protobuf
+        run: zig build run
 
       - name: Compile benchmark
         # Built but not run: timings from a shared runner are too noisy to

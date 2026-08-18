@@ -1,0 +1,26 @@
+.{
+    .name = .protobuf_echo,
+    .version = "0.0.0",
+    .fingerprint = 0xbc952f3d9c73021b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The checkout this example lives in. A path dependency, so the
+        // example always exercises the working tree — and, because zgrpc is
+        // then not the root package, it also exercises the guard that hides
+        // zgrpc's own tests and examples from consumers.
+        .zgrpc = .{ .path = "../.." },
+        // Deliberately a dependency of the *example*, not of zgrpc. zgrpc
+        // moves bytes and has no protobuf dependency; keeping it here is what
+        // makes that true rather than merely claimed.
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf?ref=v5.0.0#1f6cb06156b3ff4f52f98bc14f829c0b8393a6fc",
+            .hash = "protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "proto",
+        "src",
+    },
+}
