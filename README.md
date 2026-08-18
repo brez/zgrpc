@@ -137,56 +137,6 @@ Handlers take and return **bytes**, not generated types. Protobuf codegen
 belongs above this layer, so the transport never needs to know about message
 types — and the same handler shape works for any codec.
 
-## The HTTP/2 decision
-
-CLAUDE.md posed this as the most consequential choice in the project. Both
-candidates were evaluated on source, not docs.
-
-**Chosen: `hendriknielaender/http2.zig`, but only its frame codec and HPACK.**
-The gRPC stream sequence is driven directly by `src/h2.zig`.
-
-Neither library's high-level API can express gRPC, and the reason is
-structural rather than a missing feature. A unary gRPC response is:
-
-```
-HEADERS (:status, content-type)      -- no END_STREAM
-DATA    (length-prefixed message)    -- no END_STREAM
-HEADERS (grpc-status, grpc-message)  -- END_STREAM   <- trailers
-```
-
-`grpc-status` lives in that *trailing* HEADERS frame, after the body. But
-`http2.zig`'s connection state machine sends response headers at most once
-(`if (stream.response_headers_sent) return;` in `connection.zig`) and attaches
-END_STREAM to the final DATA frame, so a second header block is unreachable
-through its request/response API.
-
-| | `http2.zig` | `httpx.zig` |
-|---|---|---|
-| HTTP/2 trailers | validation only, not sendable | none — its trailer code is HTTP/1.1 chunked |
-| API shape | request/response state machine | route table (`server.get(path, fn)`) |
-| Frame + HPACK primitives | public and usable standalone | not separable from the server |
-| Client mode | yes (`Connection.init(..., is_server)`) | high-level client only |
-| Built on | `*std.Io.Reader` / `*std.Io.Writer` | own abstractions |
-| Last commit | 2026-05-01 | 2026-08-08 |
-| Scope | HTTP/2 only (~18k LOC) | HTTP/1+2+3, WebSocket, proxy (~36k LOC) |
-
-`http2.zig` won because the parts actually needed — `Frame`, `FrameHeader`,
-`Hpack` — are public, standalone, and built directly on Zig 0.16's
-`std.Io.Reader`/`Writer`, which is also what zig-protobuf's `StreamDecoder`
-consumes. `httpx.zig` is more actively maintained and does h2c fine, but its
-HTTP/2 is only reachable through a route-table server API with no trailer
-path at any layer.
-
-This keeps the "do not hand-roll HTTP/2" constraint where it matters: HPACK,
-Huffman coding, and frame parsing are still the dependency's. What `src/h2.zig`
-owns is the connection lifecycle and stream sequencing — the part that has to
-be gRPC-shaped.
-
-Note the dependency's default `zig build` fails, because its TLS targets need
-BoringSSL. This does not affect us: the `http2` module is declared separately
-from the TLS modules and pulls in no BoringSSL, which is verified by the fact
-that this project builds at all.
-
 ## Latency
 
 `zig build bench` measures unary calls over loopback, so it reports the

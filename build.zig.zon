@@ -33,7 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         // Frame codec and HPACK only; the gRPC stream sequence is driven by
-        // src/h2.zig. See README "The HTTP/2 decision".
+        // src/h2.zig, whose module comment says why its high-level API cannot
+        // be used.
         //
         // No protobuf dependency on purpose: this library moves `[]const u8`,
         // and codegen sits above it. A consumer that wants generated types

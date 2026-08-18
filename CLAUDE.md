@@ -127,9 +127,12 @@ The gRPC stream sequence is driven directly by `src/h2.zig`. Neither candidate's
 high-level API can express gRPC trailers: `http2.zig` guards response headers
 with `if (stream.response_headers_sent) return;` and puts END_STREAM on the
 final DATA frame, and `httpx.zig` exposes HTTP/2 only through a route-table
-server API whose only trailer support is HTTP/1.1 chunked. Full comparison and
-rationale in README.md. Note the dependency's own `zig build` fails on its
-BoringSSL TLS targets; the `http2` module itself is BoringSSL-free.
+server API whose only trailer support is HTTP/1.1 chunked. The full evaluation
+— the two side by side, and why `httpx.zig` lost despite being the
+better-maintained one — was dropped from the README once the decision stopped
+being news; it is in that file at `1450ccd`, the last commit before it went.
+Note the dependency's own `zig build` fails on its BoringSSL TLS targets; the
+`http2` module itself is BoringSSL-free.
 
 **Public API shape**: handlers take and return `[]const u8`, with a
 `CallContext` carrying the per-call arena, io, path, deadline and settable
