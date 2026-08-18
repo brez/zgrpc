@@ -1,11 +1,16 @@
 //! gRPC server over h2c: unary and server-streaming methods.
 //!
-//! Concurrency: connections are served one at a time on the calling thread.
-//! This is deliberate for now — the HPACK decoder in the upstream `http2.zig`
-//! dependency resets a process-wide scratch buffer on every header field, so
-//! decoding two header blocks concurrently would corrupt both. Moving to a
-//! thread per connection requires either a per-connection HPACK decoder
-//! upstream or a lock around decoding; see README "Known constraints".
+//! Concurrency: one connection per unit of concurrency, spawned by `serve`.
+//! Everything for a given connection — reading frames, decoding headers,
+//! running handlers, writing the response — happens on that connection's own
+//! task, so no connection state is shared and nothing here needs a lock.
+//!
+//! That single-task-per-connection rule is not just simplicity. The HPACK
+//! decoder in the upstream `http2.zig` dependency hands back slices into a
+//! *thread-local* scratch buffer that it resets on entry to every field, so
+//! two header blocks decoded concurrently on the same thread would corrupt
+//! each other. Different threads are fine, which is exactly what this
+//! structure guarantees.
 
 const std = @import("std");
 const h2 = @import("h2.zig");
@@ -13,6 +18,8 @@ const framing = @import("framing.zig");
 const status = @import("status.zig");
 const timeout = @import("timeout.zig");
 const tcp = @import("tcp.zig");
+
+const log = std.log.scoped(.zgrpc);
 
 const Status = status.Status;
 const Code = status.Code;
@@ -23,6 +30,10 @@ pub const CallContext = struct {
     /// the response it returns — is freed when the call completes, so handlers
     /// never need their own cleanup.
     allocator: std.mem.Allocator,
+    /// The server's `Io`. Handlers that do their own I/O — query a store, call
+    /// another service, wait on anything — need this rather than blocking the
+    /// connection's task outside the `Io` implementation's knowledge.
+    io: std.Io,
     /// Full method path, e.g. `/helloworld.Greeter/SayHello`.
     path: []const u8,
     /// Client deadline in nanoseconds from call start, if `grpc-timeout` was sent.
@@ -138,6 +149,15 @@ pub const Options = struct {
     /// Size of the socket read/write buffers. One HTTP/2 frame plus headers
     /// fits comfortably in the default.
     io_buffer_bytes: usize = 64 * 1024,
+    /// Ceiling on connections served at once.
+    ///
+    /// This bounds concurrency, not request rate: gRPC connections are
+    /// long-lived and multiplex calls, so a handful of clients need a handful
+    /// of slots however many RPCs they issue. It exists because each slot
+    /// costs a unit of concurrency (a thread, under `std.Io.Threaded`) plus
+    /// `2 * io_buffer_bytes`, and accepting without a bound lets a peer decide
+    /// how much of both to spend.
+    max_concurrent_connections: usize = 128,
 };
 
 pub const Server = struct {
@@ -146,6 +166,12 @@ pub const Server = struct {
     methods: []const Method,
     options: Options,
     net_server: std.Io.net.Server,
+
+    /// Connections in flight. Spawned tasks hold a pointer to the `Server`, so
+    /// it must not move once `serve` has been called.
+    connections: std.Io.Group = .init,
+    /// Free connection slots; see `Options.max_concurrent_connections`.
+    slots: std.Io.Semaphore,
 
     pub fn listen(
         allocator: std.mem.Allocator,
@@ -162,11 +188,71 @@ pub const Server = struct {
             .methods = methods,
             .options = options,
             .net_server = net_server,
+            .slots = .{ .permits = options.max_concurrent_connections },
         };
     }
 
+    /// Cancels every connection still in flight and stops listening.
+    ///
+    /// Cancelling before closing the socket, rather than after, is what makes
+    /// this safe to call while `serve` is running: a task blocked in `read`
+    /// gets `error.Canceled` from that read and unwinds normally, instead of
+    /// waking up later against a closed descriptor.
     pub fn deinit(self: *Server) void {
+        self.connections.cancel(self.io);
         self.net_server.deinit(self.io);
+    }
+
+    /// Accepts connections until cancelled, serving each on its own unit of
+    /// concurrency.
+    ///
+    /// Returns `error.Canceled` when the caller cancels it, which is the
+    /// ordinary way to stop a server rather than a failure.
+    pub fn serve(self: *Server) !void {
+        errdefer self.connections.cancel(self.io);
+
+        while (true) {
+            // Taken before the accept, not after: waiting here leaves an
+            // over-quota connection in the kernel's backlog, where the peer
+            // sees a slow server. Accepting first and then blocking would let
+            // it look connected while nothing was ever going to read it.
+            try self.slots.wait(self.io);
+
+            const stream = self.net_server.accept(self.io) catch |err| {
+                self.slots.post(self.io);
+                return err;
+            };
+
+            // `concurrent` rather than `async`: `async` is allowed to run the
+            // task inline, which for a long-lived connection would mean never
+            // returning to accept the next one.
+            self.connections.concurrent(self.io, connectionTask, .{ self, stream }) catch {
+                // No unit of concurrency to be had. Serving it inline is worse
+                // than serving it in parallel but much better than dropping
+                // it, and it applies backpressure to the accept loop for
+                // exactly as long as the shortage lasts.
+                connectionTask(self, stream);
+            };
+        }
+    }
+
+    /// One connection, start to finish. Errors are logged rather than
+    /// returned: nothing is waiting on an individual connection's outcome, and
+    /// one peer hanging up must not stop the server.
+    fn connectionTask(self: *Server, stream: std.Io.net.Stream) void {
+        defer self.slots.post(self.io);
+        defer stream.close(self.io);
+
+        self.serveConnection(stream) catch |err| switch (err) {
+            // The ordinary ends of a connection: the peer hung up, said
+            // GOAWAY, or the server is shutting down.
+            error.EndOfStream,
+            error.ConnectionClosed,
+            error.ConnectionResetByPeer,
+            error.Canceled,
+            => {},
+            else => log.warn("connection failed: {t}", .{err}),
+        };
     }
 
     /// The address actually bound, with the ephemeral port resolved — the
@@ -176,7 +262,10 @@ pub const Server = struct {
     }
 
     /// Accepts one connection and serves calls on it until the peer closes it
-    /// or sends GOAWAY.
+    /// or sends GOAWAY, on the calling task.
+    ///
+    /// `serve` is what a real server wants; this is for tests and for callers
+    /// that want to drive the accept loop themselves.
     pub fn acceptAndServe(self: *Server) !void {
         const stream = try self.net_server.accept(self.io);
         defer stream.close(self.io);
@@ -274,6 +363,7 @@ pub const Server = struct {
 
         var ctx: CallContext = .{
             .allocator = call_arena.allocator(),
+            .io = self.io,
             .path = path,
             .deadline_ns = deadline_ns,
             .request_headers = &headers,

@@ -488,3 +488,119 @@ test "abandoning a stream early leaves the connection usable" {
     const produced = sent_count.load(.monotonic);
     try testing.expect(produced < total);
 }
+
+// -- concurrency -------------------------------------------------------------
+
+/// How many calls have reached `rendezvousHandler` and are waiting there.
+var arrived: std.atomic.Value(usize) = .init(0);
+
+/// Blocks until a second call reaches it, then reports whether it got one.
+///
+/// This is the whole concurrency test: served one connection at a time, the
+/// first call parks here and the second never arrives, so the answer is
+/// "alone". It cannot pass by accident.
+fn rendezvousHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    _ = arrived.fetchAdd(1, .monotonic);
+
+    // Bounded so a regression fails the test instead of hanging it.
+    var waited_ms: usize = 0;
+    while (arrived.load(.monotonic) < 2 and waited_ms < 2000) : (waited_ms += 1) {
+        try std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake);
+    }
+
+    return ctx.allocator.dupe(u8, if (arrived.load(.monotonic) >= 2) "both" else "alone");
+}
+
+const rendezvous_path = "/zgrpc.test.Echo/Rendezvous";
+
+const concurrent_methods = [_]zgrpc.Method{
+    zgrpc.Method.unary(echo_path, echoHandler),
+    zgrpc.Method.unary(rendezvous_path, rendezvousHandler),
+};
+
+fn serveTask(server: *zgrpc.Server) void {
+    server.serve() catch |err| switch (err) {
+        // The test cancels the accept loop to shut the server down.
+        error.Canceled => {},
+        else => std.debug.print("serve error: {t}\n", .{err}),
+    };
+}
+
+const RendezvousResult = struct {
+    code: ?zgrpc.Code = null,
+    message: [8]u8 = @splat(0),
+    message_len: usize = 0,
+
+    fn text(self: *const RendezvousResult) []const u8 {
+        return self.message[0..self.message_len];
+    }
+};
+
+/// One client on its own connection, so the two calls cannot share a stream.
+fn rendezvousClient(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    address: std.Io.net.IpAddress,
+    authority: []const u8,
+    out: *RendezvousResult,
+) void {
+    const client = zgrpc.Client.connect(allocator, io, address, authority, .{}) catch |err| {
+        std.debug.print("client connect failed: {t}\n", .{err});
+        return;
+    };
+    defer client.deinit();
+
+    var response = client.call(rendezvous_path, "", .{}) catch |err| {
+        std.debug.print("client call failed: {t}\n", .{err});
+        return;
+    };
+    defer response.deinit();
+
+    out.code = response.call_status.code;
+    out.message_len = @min(response.message.len, out.message.len);
+    @memcpy(out.message[0..out.message_len], response.message[0..out.message_len]);
+}
+
+test "two connections are served at the same time, not one after the other" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(server);
+    server.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &concurrent_methods,
+        .{},
+    );
+    defer server.deinit();
+
+    const bound = server.boundAddress();
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    var serving = try io.concurrent(serveTask, .{server});
+    defer _ = serving.cancel(io);
+
+    arrived.store(0, .monotonic);
+
+    var results: [2]RendezvousResult = .{ .{}, .{} };
+    var clients: std.Io.Group = .init;
+    errdefer clients.cancel(io);
+    for (&results) |*result| {
+        try clients.concurrent(io, rendezvousClient, .{ allocator, io, bound, authority, result });
+    }
+    try clients.await(io);
+
+    for (&results) |*result| {
+        try testing.expectEqual(zgrpc.Code.ok, result.code);
+        // "alone" means the second call never got in while the first was
+        // running — the server serialised the two connections.
+        try testing.expectEqualStrings("both", result.text());
+    }
+}

@@ -9,7 +9,7 @@ Status: **unary and server streaming work end to end** and interoperate with
 grpc-go (milestones 1 and 3).
 
 ```
-zig build test              # unit + integration tests (72)
+zig build test              # unit + integration tests (73)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency baseline
@@ -37,8 +37,12 @@ const methods = [_]zgrpc.Method{
 
 var server = try zgrpc.Server.listen(allocator, io, address, &methods, .{});
 defer server.deinit();
-try server.acceptAndServe();
+try server.serve();
 ```
+
+`serve` accepts until cancelled and gives each connection its own unit of
+concurrency. `acceptAndServe` handles a single connection on the calling task,
+for callers that want to drive the accept loop themselves.
 
 Client:
 
@@ -183,18 +187,24 @@ trace per allocation and on ARM costs more than the RPC being measured.
 
 ## Known constraints
 
-**Single-threaded connection handling.** `Hpack.decodeHeaderFieldView` in the
-dependency calls `ScratchBuffer.reset()` on entry and returns slices that may
-point into that **process-wide** buffer. Two threads decoding header blocks
-concurrently would corrupt each other. Consequences:
+**One call at a time per connection.** `serve` runs each connection on its own
+unit of concurrency, so connections do not block each other, but a connection
+handles its calls in sequence. A client that opens a second stream while the
+first is still running gets it served after, not alongside. Fixing that needs
+the same restructuring as prompt cancellation, below.
+
+The HPACK decoder in the dependency constrains how far that can go.
+`Hpack.decodeHeaderFieldView` calls `ScratchBuffer.reset()` on entry and
+returns slices into that buffer, which is `threadlocal` — so different threads
+decoding concurrently are fine, and two header blocks interleaved *on one
+thread* are not. Two consequences:
 
 1. `src/h2.zig` copies every header into an arena immediately after decoding
    it, before decoding the next — a lazy copy would silently corrupt all but
    the last header.
-2. The server serves connections sequentially. Thread-per-connection needs
-   either a per-connection decoder upstream or a lock around decoding. This is
-   the first thing to fix before the milestone-2 load benchmark, since it caps
-   server throughput at one connection.
+2. A connection's frames must be decoded on one task from end to end, which is
+   what `serve` guarantees. Decoding several connections' header blocks on a
+   shared worker would need a per-connection decoder upstream, or a lock.
 
 **Stream cancellation is bounded by flow control, not immediate.** A client
 that abandons a stream sends RST_STREAM and stops replenishing that stream's
@@ -206,11 +216,11 @@ a server produce well past the point of cancellation before it blocks and
 looks.
 
 Making it immediate needs the transport to read frames while it is writing,
-which this single-threaded design cannot do. A non-blocking `poll` before each
+which the current single-task-per-connection design cannot do. A non-blocking `poll` before each
 send was tried and removed: `std.Io.net.Stream.Reader` latches its error state,
 so one failed `fillMore` poisons the reader and every later read fails with
 `error.ReadFailed`. The real fix is a reader that is not driven by the writer —
-the same restructuring the concurrency limit above needs.
+the same restructuring the per-connection call limit above needs.
 
 **No compression.** The compressed-message flag is parsed and rejected;
 `grpc-encoding` is not negotiated.

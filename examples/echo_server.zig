@@ -67,11 +67,6 @@ pub fn main() !void {
     try stdout.interface.print("listening {d}\n", .{server.boundAddress().getPort()});
     try stdout.interface.flush();
 
-    // Serve connections sequentially; see the concurrency note in server.zig.
-    while (true) {
-        server.acceptAndServe() catch |err| switch (err) {
-            error.EndOfStream, error.ConnectionResetByPeer => continue,
-            else => return err,
-        };
-    }
+    // One task per connection; see the concurrency note in server.zig.
+    try server.serve();
 }
