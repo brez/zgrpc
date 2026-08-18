@@ -235,6 +235,11 @@ pub const Client = struct {
         self.allocator.destroy(self);
     }
 
+    /// Whether this client can take a new call. See `h2.Connection.isUsable`.
+    pub fn isUsable(self: *Client) bool {
+        return self.conn.isUsable();
+    }
+
     /// Performs one unary call: send a single message, receive a single
     /// message plus status.
     pub fn call(

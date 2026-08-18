@@ -5,14 +5,15 @@
 Real gRPC over HTTP/2 (h2c) for Zig — actual wire protocol, verified against
 the reference `grpc-go` implementation.
 
-Status: **unary and server streaming work end to end**, concurrently, and
-interoperate with grpc-go (milestones 1 and 3).
+Status: **unary and server streaming work end to end**, concurrently, over a
+pool of persistent connections, and interoperate with grpc-go (milestones 1, 3
+and most of 4).
 
 ```
-zig build test              # unit + integration tests (75)
+zig build test              # unit + integration tests (79)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
-zig build bench             # loopback latency baseline
+zig build bench             # loopback latency baseline, plus pool under load
 zig build bench-build       # compile the benchmark without running it
 zig build test-integration-build   # compile integration tests without running
 ./interop/run.sh            # grpc-go interop suite (requires Go)
@@ -89,6 +90,21 @@ while (try stream.next()) |message| {
 }
 if (!stream.finalStatus().isOk()) { /* stream.finalStatus().code */ }
 ```
+
+Several connections to one peer:
+
+```zig
+const pool = try zgrpc.Pool.init(allocator, io, address, "host:50051", .{});
+defer pool.deinit();
+
+var response = try pool.call("/helloworld.Greeter/SayHello", request_bytes, .{});
+defer response.deinit();
+```
+
+`Pool` has the same `call` and `callServerStream` as `Client`, spreads them
+over its connections, and replaces any the peer has closed. Connections are
+opened only when every existing one is busy, so `Options.size` is a ceiling
+rather than a target. See "Connection pooling".
 
 Handlers take and return **bytes**, not generated types. Protobuf codegen
 belongs above this layer, so the transport never needs to know about message
@@ -281,6 +297,46 @@ the reader task alone, which settles it — and `src/h2.zig` still copies each
 header into an arena before decoding the next, because a lazy copy would
 corrupt all but the last.
 
+## Connection pooling
+
+`Client` is one connection. `Pool` is several to the same peer, and is what
+you want unless you have a reason not to — it is also where connection
+lifecycle lives, since a `Client` whose peer has gone away stays broken.
+
+HTTP/2 multiplexes, so the question is why more than one connection is ever
+worth having. Two reasons, both of which show up only under concurrency: the
+peer's `SETTINGS_MAX_CONCURRENT_STREAMS` caps calls in flight on a connection,
+and one connection's frames are parsed by one reader task, so past some call
+rate that task saturates a core.
+
+The policy is: take an idle connection if there is one; failing that, open
+another up to `Options.size`; failing that, share the least loaded. Growing
+before sharing matters because the only reason to want a second connection is
+that the first is busy — and it means the ceiling is free until concurrency
+justifies it. A caller issuing one call at a time holds exactly one connection
+whatever the ceiling is.
+
+Measured on loopback (`zig build bench`, "under load", 1KB payload):
+
+```
+   callers 8    pool 1   p50   161.5us  p99  3081.7us   25543 calls/s
+   callers 8    pool 4   p50   106.5us  p99  2467.3us   34240 calls/s
+   callers 64   pool 1   p50  2230.1us  p99 13630.0us   19841 calls/s
+   callers 64   pool 4   p50  1563.9us  p99 13321.9us   26019 calls/s
+```
+
+About 30% more throughput and 30% off p50 at both concurrency levels, which is
+where the default ceiling of 4 comes from. It is a property of the machine —
+one reader task per connection, so the useful ceiling tracks cores — and worth
+re-measuring on the target host. Same caveat as everything else here: the
+machine was loaded, so read the ratios and not the absolute figures.
+
+A connection the peer has closed or sent GOAWAY on is retired at the next call
+and replaced. Retirement is not cancellation: calls already running on it are
+left to finish, and it is closed when the last one does. Nothing is retried —
+the call in flight when a connection dies fails, and it is the caller's
+business whether to try again.
+
 ## Known constraints
 
 **No compression.** The compressed-message flag is parsed and rejected;
@@ -294,6 +350,15 @@ much faster or much slower than assumed will not get the same treatment here.
 **No deadline enforcement on the server.** `grpc-timeout` is decoded and handed
 to the handler as `ctx.deadline_ns`, but nothing cancels a handler that runs
 past it. Handlers that care must check it themselves.
+
+**A pool is one peer.** Every connection goes to the same address. Spreading
+calls over several peers is load balancing, which needs name resolution and a
+picker, and nothing needs that yet.
+
+**No retries.** A call in flight when its connection dies fails with a
+transport error. The pool replaces the connection; it does not re-send the
+call, which it could not do safely without knowing whether the method is
+idempotent.
 
 **h2c only, no TLS.** Per the project constraint that all consumers are inside
 one trusted VPC. There is no ALPN, so this cannot talk to a TLS gRPC endpoint.
@@ -340,7 +405,8 @@ src/h2.zig               HTTP/2 connection driver: reader task, per-stream
 src/framing.zig          gRPC 5-byte length-prefixed message framing
 src/status.zig           grpc-status codes, percent-encoded grpc-message
 src/timeout.zig          grpc-timeout deadline encoding
-src/client.zig           unary + server-streaming client, concurrent calls
+src/client.zig           unary + server-streaming client, one connection
+src/pool.zig             several persistent connections to one peer
 src/server.zig           unary + server-streaming server, task per call
 src/tcp.zig              TCP_NODELAY
 src/integration_test.zig end-to-end tests over loopback

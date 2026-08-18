@@ -318,6 +318,8 @@ pub const Stream = struct {
 
     /// True once the peer has reset this stream. Cheap enough to check before
     /// producing each message of a long response.
+    ///
+    /// (Stream-level; see `Connection.isUsable` for the connection.)
     pub fn isReset(self: *Stream) bool {
         const io = self.conn.io;
         self.conn.mutex.lockUncancelable(io);
@@ -462,6 +464,19 @@ pub const Connection = struct {
         self.header_buf.deinit(self.allocator);
         self.payload_buf.deinit(self.allocator);
         self.pending_wakes.deinit(self.allocator);
+    }
+
+    /// Whether this connection can take a new stream.
+    ///
+    /// False once the reader has stopped or the peer has said GOAWAY. Either
+    /// way the calls already running may still finish — GOAWAY means "open no
+    /// more streams", not "abandon the ones in progress" — so this gates new
+    /// work rather than existing work.
+    pub fn isUsable(self: *Connection) bool {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return !self.closed and self.goaway_received == null;
     }
 
     /// The error a caller should see for a connection that is no longer

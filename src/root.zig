@@ -5,8 +5,9 @@
 //!   framing.zig gRPC 5-byte length-prefixed message framing
 //!   status.zig  grpc-status / grpc-message
 //!   timeout.zig grpc-timeout deadline propagation
-//!   client.zig  unary client
-//!   server.zig  unary server
+//!   client.zig  unary + server-streaming client, one connection
+//!   server.zig  unary + server-streaming server
+//!   pool.zig    several persistent connections to one peer
 
 const std = @import("std");
 
@@ -17,10 +18,13 @@ pub const status = @import("status.zig");
 pub const timeout = @import("timeout.zig");
 pub const client = @import("client.zig");
 pub const server = @import("server.zig");
+pub const pool = @import("pool.zig");
 
 pub const Code = status.Code;
 pub const Status = status.Status;
 pub const Client = client.Client;
+pub const Pool = pool.Pool;
+pub const PooledStream = pool.PooledStream;
 pub const Server = server.Server;
 pub const Method = server.Method;
 pub const ServerStream = server.ServerStream;
@@ -37,4 +41,5 @@ test {
     _ = timeout;
     _ = client;
     _ = server;
+    _ = pool;
 }

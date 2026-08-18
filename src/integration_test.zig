@@ -731,3 +731,224 @@ test "cancellation reaches the handler without waiting for the window to close" 
     try testing.expectEqual(@as(u8, 1), cancel_outcome.load(.acquire));
     try testing.expectEqual(@as(usize, 1), cancel_sends.load(.monotonic));
 }
+
+// -- connection pool ---------------------------------------------------------
+
+/// A pool call on an existing pool, for running several at once.
+fn poolRendezvousCall(p: *zgrpc.Pool, out: *RendezvousResult) void {
+    var response = p.call(rendezvous_path, "", .{}) catch |err| {
+        std.debug.print("pool call failed: {t}\n", .{err});
+        return;
+    };
+    defer response.deinit();
+    out.record(&response);
+}
+
+/// A server on its own task, plus a pool pointed at it.
+const PoolFixture = struct {
+    server: *zgrpc.Server,
+    serving: std.Io.Future(void),
+    authority: []u8,
+    bound: std.Io.net.IpAddress,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+
+    fn start(allocator: std.mem.Allocator, io: std.Io) !PoolFixture {
+        const server = try allocator.create(zgrpc.Server);
+        errdefer allocator.destroy(server);
+        server.* = try zgrpc.Server.listen(
+            allocator,
+            io,
+            std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            &methods,
+            .{},
+        );
+
+        const bound = server.boundAddress();
+        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+        errdefer allocator.free(authority);
+
+        return .{
+            .server = server,
+            .serving = try io.concurrent(serveTask, .{server}),
+            .authority = authority,
+            .bound = bound,
+            .allocator = allocator,
+            .io = io,
+        };
+    }
+
+    /// Shuts the server down but keeps the address and authority, which a
+    /// pool pointed at this fixture has borrowed and is still using.
+    fn stopServer(self: *PoolFixture) void {
+        _ = self.serving.cancel(self.io);
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+    }
+
+    fn deinit(self: *PoolFixture) void {
+        self.allocator.free(self.authority);
+    }
+};
+
+test "a pool serves sequential calls on one connection however large it may grow" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .size = 4 });
+    defer pool.deinit();
+
+    for (0..5) |i| {
+        var buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&buf, "message {d}", .{i});
+
+        var response = try pool.call(echo_path, payload, .{});
+        defer response.deinit();
+        try testing.expectEqualStrings(payload, response.message);
+    }
+
+    // Capacity is a ceiling, not a target: nothing was ever busy, so nothing
+    // beyond the first connection was ever worth opening.
+    try testing.expectEqual(@as(usize, 1), pool.connectionCount());
+}
+
+test "a pool opens a second connection only when the first is busy" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .size = 4 });
+    defer pool.deinit();
+
+    arrived.store(0, .monotonic);
+
+    // Both handlers park until the other arrives, so the first connection is
+    // provably still busy when the second call goes looking for one.
+    var results: [2]RendezvousResult = .{ .{}, .{} };
+    var calls: std.Io.Group = .init;
+    errdefer calls.cancel(io);
+    for (&results) |*result| {
+        try calls.concurrent(io, poolRendezvousCall, .{ pool, result });
+    }
+    try calls.await(io);
+
+    for (&results) |*result| {
+        try testing.expectEqual(zgrpc.Code.ok, result.code);
+        try testing.expectEqualStrings("both", result.text());
+    }
+    try testing.expectEqual(@as(usize, 2), pool.connectionCount());
+}
+
+test "a pool replaces a connection the server has closed" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    // The authority outlives the server here: the pool borrows it, and this
+    // test deliberately takes the server away underneath it.
+    defer fixture.deinit();
+
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{});
+    defer pool.deinit();
+
+    {
+        var response = try pool.call(echo_path, "before", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("before", response.message);
+    }
+
+    // Drop the server and stand a new one up on the same port, so the pool's
+    // connection is dead but the peer is reachable again. A bare `Client`
+    // would be finished at this point; the pool's job is to notice and
+    // reconnect.
+    const port = fixture.bound.getPort();
+    fixture.stopServer();
+
+    var replacement = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(replacement);
+    replacement.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable,
+        &methods,
+        .{},
+    );
+    defer replacement.deinit();
+    var serving = try io.concurrent(serveTask, .{replacement});
+    defer _ = serving.cancel(io);
+
+    // The pool notices the dead connection when it next looks for one. The
+    // first attempt may still land on the connection as it is dying, which is
+    // a transport error and not something this library retries — so the check
+    // is that the pool recovers, not that no call is ever lost.
+    var recovered = false;
+    for (0..10) |_| {
+        var response = pool.call(echo_path, "after", .{}) catch continue;
+        defer response.deinit();
+        try testing.expectEqualStrings("after", response.message);
+        recovered = true;
+        break;
+    }
+    try testing.expect(recovered);
+    try testing.expectEqual(@as(usize, 1), pool.connectionCount());
+}
+
+test "a pooled server-streaming call holds its connection until deinit" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .size = 4 });
+    defer pool.deinit();
+
+    {
+        var stream = try pool.callServerStream(count_path, "3", .{});
+        defer stream.deinit();
+
+        // Unary calls made while the stream is open must not land on its
+        // connection as if it were idle — the stream still holds it.
+        var response = try pool.call(echo_path, "alongside", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("alongside", response.message);
+        try testing.expectEqual(@as(usize, 2), pool.connectionCount());
+
+        var seen: usize = 0;
+        while (try stream.next()) |message| : (seen += 1) {
+            var buf: [32]u8 = undefined;
+            try testing.expectEqualStrings(
+                try std.fmt.bufPrint(&buf, "item-{d}", .{seen}),
+                message,
+            );
+        }
+        try testing.expectEqual(@as(usize, 3), seen);
+        try testing.expectEqual(zgrpc.Code.ok, stream.finalStatus().code);
+    }
+
+    // Released, so the next call reuses a connection rather than growing.
+    var after = try pool.call(echo_path, "after", .{});
+    defer after.deinit();
+    try testing.expectEqualStrings("after", after.message);
+    try testing.expectEqual(@as(usize, 2), pool.connectionCount());
+}

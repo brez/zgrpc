@@ -147,6 +147,16 @@ WINDOW_UPDATE on stream 0, since SETTINGS cannot set it). Credit is returned on
 consumption, not arrival — the connection window is then the bound on what a
 peer can make one connection buffer.
 
+**Connection pooling**: `Pool` holds several connections to one peer above
+`Client`, which stays one connection. Ceiling of 4 by default, grown lazily —
+a connection is opened only when every existing one is busy, so a sequential
+caller holds exactly one however high the ceiling. Idle first, then grow, then
+share the least loaded. Retired connections finish their calls before closing;
+no retries. Worth ~30% throughput and ~30% off p50 at 8 and 64 concurrent
+callers on loopback (`zig build bench`, "under load"), which is where the
+default came from — re-measure on the target host, since the useful ceiling
+tracks cores.
+
 **Server streaming (milestone 3) is done**: `Method.serverStream` +
 `ServerStream.send` on the server, `callServerStream` + `ResponseStream.next`
 on the client, verified against grpc-go. Messages are not buffered whole at
@@ -157,7 +167,8 @@ arrival, so `stream.send` fails at the next message whatever the flow-control
 window is doing. Verified by an integration test in which the handler is parked
 with a wide-open window.
 
-Still open: connection pooling (the client is still one connection per
-`Client`), the milestone-2 in-VPC benchmark numbers, and a clean loopback
-re-measurement — the last one was taken on a loaded machine and only the A/B
-between old and new transports is trustworthy.
+Still open: the milestone-2 in-VPC benchmark numbers, and a clean loopback
+re-measurement — every number recorded since the concurrency work was taken on
+a loaded machine, so only ratios are trustworthy. Milestone 4 is done apart
+from server-side deadline enforcement: `grpc-timeout` is decoded and handed to
+handlers as `ctx.deadline_ns`, but nothing cancels a handler that overruns it.
