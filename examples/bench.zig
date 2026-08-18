@@ -18,7 +18,7 @@ fn echo(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
     return ctx.allocator.dupe(u8, request);
 }
 
-const methods = [_]zgrpc.Method{.{ .path = path, .handler = echo }};
+const methods = [_]zgrpc.Method{zgrpc.Method.unary(path, echo)};
 
 fn serveThread(server: *zgrpc.Server) void {
     server.acceptAndServe() catch {};

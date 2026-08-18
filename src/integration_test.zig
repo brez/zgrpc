@@ -50,12 +50,71 @@ fn failEarlyStreamHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: 
     return ctx.fail(.invalid_argument, "bad range");
 }
 
+/// How many calls have reached `rendezvousHandler` and are waiting there.
+var arrived: std.atomic.Value(usize) = .init(0);
+
+/// Blocks until a second call reaches it, then reports whether it got one.
+///
+/// This is the concurrency test in one handler: served one call at a time, the
+/// first parks here and the second never arrives, so the answer is "alone". It
+/// cannot pass by accident.
+fn rendezvousHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    _ = arrived.fetchAdd(1, .monotonic);
+
+    // Bounded so a regression fails the test instead of hanging it.
+    var waited_ms: usize = 0;
+    while (arrived.load(.monotonic) < 2 and waited_ms < 2000) : (waited_ms += 1) {
+        try std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake);
+    }
+
+    return ctx.allocator.dupe(u8, if (arrived.load(.monotonic) >= 2) "both" else "alone");
+}
+
+/// Set by the test once it has proved the server received its RST_STREAM.
+var cancel_proceed: std.atomic.Value(bool) = .init(false);
+/// Messages `cancelProbeHandler` got out.
+var cancel_sends: std.atomic.Value(usize) = .init(0);
+/// What the handler saw from its second send: 0 still running, 1 StreamReset,
+/// 2 the send succeeded, 3 some other error.
+var cancel_outcome: std.atomic.Value(u8) = .init(0);
+
+/// Sends one message, waits to be told the cancellation has landed, then tries
+/// to send another.
+///
+/// The second send has a wide-open flow-control window, so nothing about it
+/// blocks. It has to fail purely because the connection's reader already saw
+/// the RST_STREAM and recorded it — which is what "prompt" means here.
+fn cancelProbeHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
+    _ = request;
+    try stream.send("first");
+    _ = cancel_sends.fetchAdd(1, .monotonic);
+
+    var waited_ms: usize = 0;
+    while (!cancel_proceed.load(.acquire) and waited_ms < 5000) : (waited_ms += 1) {
+        try std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake);
+    }
+
+    if (stream.send("second")) |_| {
+        _ = cancel_sends.fetchAdd(1, .monotonic);
+        cancel_outcome.store(2, .release);
+    } else |err| {
+        cancel_outcome.store(if (err == error.StreamReset) 1 else 3, .release);
+        return err;
+    }
+}
+
+const rendezvous_path = "/zgrpc.test.Echo/Rendezvous";
+const cancel_probe_path = "/zgrpc.test.Echo/CancelProbe";
+
 const methods = [_]zgrpc.Method{
     zgrpc.Method.unary(echo_path, echoHandler),
     zgrpc.Method.unary(fail_path, failHandler),
+    zgrpc.Method.unary(rendezvous_path, rendezvousHandler),
     zgrpc.Method.serverStream(count_path, countHandler),
     zgrpc.Method.serverStream(fail_mid_path, failMidStreamHandler),
     zgrpc.Method.serverStream(fail_early_path, failEarlyStreamHandler),
+    zgrpc.Method.serverStream(cancel_probe_path, cancelProbeHandler),
 };
 
 const Harness = struct {
@@ -482,42 +541,16 @@ test "abandoning a stream early leaves the connection usable" {
     // Cancellation must actually stop the handler, not merely be tolerated:
     // a server that streams the whole result set into a discarded stream
     // wastes the connection for as long as the query is large.
-    // Cancellation is bounded by flow control rather than instant: the server
-    // may fill the stream's 64KB window before it blocks and notices. What must
-    // not happen is streaming the whole result set into a discarded stream.
+    //
+    // How far it gets is now a matter of round-trip timing rather than of the
+    // flow-control window, so the bound checked here is deliberately loose.
+    // The deterministic claim is tested separately, in "cancellation reaches
+    // the handler without waiting for the window to close".
     const produced = sent_count.load(.monotonic);
     try testing.expect(produced < total);
 }
 
 // -- concurrency -------------------------------------------------------------
-
-/// How many calls have reached `rendezvousHandler` and are waiting there.
-var arrived: std.atomic.Value(usize) = .init(0);
-
-/// Blocks until a second call reaches it, then reports whether it got one.
-///
-/// This is the whole concurrency test: served one connection at a time, the
-/// first call parks here and the second never arrives, so the answer is
-/// "alone". It cannot pass by accident.
-fn rendezvousHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
-    _ = request;
-    _ = arrived.fetchAdd(1, .monotonic);
-
-    // Bounded so a regression fails the test instead of hanging it.
-    var waited_ms: usize = 0;
-    while (arrived.load(.monotonic) < 2 and waited_ms < 2000) : (waited_ms += 1) {
-        try std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake);
-    }
-
-    return ctx.allocator.dupe(u8, if (arrived.load(.monotonic) >= 2) "both" else "alone");
-}
-
-const rendezvous_path = "/zgrpc.test.Echo/Rendezvous";
-
-const concurrent_methods = [_]zgrpc.Method{
-    zgrpc.Method.unary(echo_path, echoHandler),
-    zgrpc.Method.unary(rendezvous_path, rendezvousHandler),
-};
 
 fn serveTask(server: *zgrpc.Server) void {
     server.serve() catch |err| switch (err) {
@@ -535,9 +568,25 @@ const RendezvousResult = struct {
     fn text(self: *const RendezvousResult) []const u8 {
         return self.message[0..self.message_len];
     }
+
+    fn record(self: *RendezvousResult, response: *const zgrpc.client.Response) void {
+        self.code = response.call_status.code;
+        self.message_len = @min(response.message.len, self.message.len);
+        @memcpy(self.message[0..self.message_len], response.message[0..self.message_len]);
+    }
 };
 
-/// One client on its own connection, so the two calls cannot share a stream.
+/// One rendezvous call on an existing client.
+fn rendezvousCall(client: *zgrpc.Client, out: *RendezvousResult) void {
+    var response = client.call(rendezvous_path, "", .{}) catch |err| {
+        std.debug.print("call failed: {t}\n", .{err});
+        return;
+    };
+    defer response.deinit();
+    out.record(&response);
+}
+
+/// One rendezvous call on a connection of its own.
 fn rendezvousClient(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -550,16 +599,7 @@ fn rendezvousClient(
         return;
     };
     defer client.deinit();
-
-    var response = client.call(rendezvous_path, "", .{}) catch |err| {
-        std.debug.print("client call failed: {t}\n", .{err});
-        return;
-    };
-    defer response.deinit();
-
-    out.code = response.call_status.code;
-    out.message_len = @min(response.message.len, out.message.len);
-    @memcpy(out.message[0..out.message_len], response.message[0..out.message_len]);
+    rendezvousCall(client, out);
 }
 
 test "two connections are served at the same time, not one after the other" {
@@ -575,7 +615,7 @@ test "two connections are served at the same time, not one after the other" {
         allocator,
         io,
         std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
-        &concurrent_methods,
+        &methods,
         .{},
     );
     defer server.deinit();
@@ -603,4 +643,91 @@ test "two connections are served at the same time, not one after the other" {
         // running — the server serialised the two connections.
         try testing.expectEqualStrings("both", result.text());
     }
+}
+
+test "two calls on one connection are multiplexed, not queued" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    arrived.store(0, .monotonic);
+
+    // Both calls share one `Client`, so they share one HTTP/2 connection and
+    // are distinguished only by stream id. Queued, the first would park in the
+    // handler and the second would never be read off the socket.
+    var results: [2]RendezvousResult = .{ .{}, .{} };
+    var calls: std.Io.Group = .init;
+    errdefer calls.cancel(io);
+    for (&results) |*result| {
+        try calls.concurrent(io, rendezvousCall, .{ pair.client, result });
+    }
+    try calls.await(io);
+
+    for (&results) |*result| {
+        try testing.expectEqual(zgrpc.Code.ok, result.code);
+        try testing.expectEqualStrings("both", result.text());
+    }
+}
+
+test "cancellation reaches the handler without waiting for the window to close" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    cancel_proceed.store(false, .release);
+    cancel_sends.store(0, .monotonic);
+    cancel_outcome.store(0, .release);
+
+    {
+        var stream = try pair.client.callServerStream(cancel_probe_path, "", .{});
+        const first = try stream.next();
+        try testing.expectEqualStrings("first", first.?);
+        // Cancels the call. The handler is parked, not writing, so nothing
+        // about its flow-control window is about to change.
+        stream.deinit();
+    }
+
+    // A full round trip on the same connection. Frames arrive in order, so a
+    // reply to a request sent after the RST_STREAM proves the server processed
+    // the RST_STREAM. It also needs the server to run this call while the
+    // probe handler is still parked, which is the other half of the point.
+    {
+        var response = try pair.client.call(echo_path, "ping", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("ping", response.message);
+    }
+
+    cancel_proceed.store(true, .release);
+
+    var waited_ms: usize = 0;
+    while (cancel_outcome.load(.acquire) == 0 and waited_ms < 5000) : (waited_ms += 1) {
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+
+    // 2 would mean the send went through: the server had credit and no idea
+    // the call was gone, which is exactly the old behaviour.
+    try testing.expectEqual(@as(u8, 1), cancel_outcome.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), cancel_sends.load(.monotonic));
 }

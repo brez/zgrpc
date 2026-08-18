@@ -27,6 +27,14 @@ fn count(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStre
     }
 }
 
+/// Echoes after a fixed pause, so a caller can tell concurrent handling from
+/// sequential handling by the clock: N of these at once should take about as
+/// long as one, not N times as long.
+fn slow(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    try std.Io.sleep(ctx.io, .fromMilliseconds(300), .awake);
+    return ctx.allocator.dupe(u8, request);
+}
+
 /// Emits two messages and then fails, so the status has to travel in trailers
 /// after a body rather than as a Trailers-Only response.
 fn countThenFail(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.ServerStream) anyerror!void {
@@ -39,6 +47,7 @@ fn countThenFail(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgrpc.Se
 const methods = [_]zgrpc.Method{
     zgrpc.Method.unary("/zgrpc.test.Echo/Call", echo),
     zgrpc.Method.unary("/zgrpc.test.Echo/Fail", fail),
+    zgrpc.Method.unary("/zgrpc.test.Echo/Slow", slow),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/Count", count),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/CountThenFail", countThenFail),
 };

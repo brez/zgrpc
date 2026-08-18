@@ -1,17 +1,18 @@
 //! gRPC server over h2c: unary and server-streaming methods.
 //!
-//! Concurrency: one connection per unit of concurrency, spawned by `serve`.
-//! Everything for a given connection — reading frames, decoding headers,
-//! running handlers, writing the response — happens on that connection's own
-//! task, so no connection state is shared and nothing here needs a lock.
+//! Concurrency, outermost first: `serve` gives every connection its own unit
+//! of concurrency, and every connection gives every call its own. Frames are
+//! read by the connection's reader task in `h2.zig` and filed into per-stream
+//! mailboxes, so a handler that is slow, blocked, or streaming a million rows
+//! holds up nothing but itself.
 //!
-//! That single-task-per-connection rule is not just simplicity. The HPACK
-//! decoder in the upstream `http2.zig` dependency hands back slices into a
-//! *thread-local* scratch buffer that it resets on entry to every field, so
-//! two header blocks decoded concurrently on the same thread would corrupt
-//! each other. Different threads are fine, which is exactly what this
-//! structure guarantees.
-
+//! One rule this structure exists to keep: a connection's header blocks are
+//! decoded on exactly one task. The HPACK decoder in the upstream `http2.zig`
+//! dependency hands back slices into a *thread-local* scratch buffer that it
+//! resets on entry to every field, and its dynamic table is connection-wide
+//! ordered state. Different threads are fine; two of a connection's blocks
+//! interleaved on one thread are not. Decoding lives in the reader task alone,
+//! which settles it.
 const std = @import("std");
 const h2 = @import("h2.zig");
 const framing = @import("framing.zig");
@@ -23,6 +24,10 @@ const log = std.log.scoped(.zgrpc);
 
 const Status = status.Status;
 const Code = status.Code;
+
+/// How much room to offer the transport for each read. One max-size HTTP/2
+/// frame, so a full DATA frame is handed over in one go.
+const recv_chunk = h2.default_max_frame_size;
 
 /// Everything a handler learns about the call in progress.
 pub const CallContext = struct {
@@ -96,7 +101,7 @@ pub const Method = struct {
 pub const ServerStream = struct {
     allocator: std.mem.Allocator,
     conn: *h2.Connection,
-    stream_id: u32,
+    stream: *h2.Stream,
     /// Response HEADERS are written lazily on the first `send`, so a handler
     /// that fails before producing anything can still be answered with a
     /// compact Trailers-Only response.
@@ -113,15 +118,15 @@ pub const ServerStream = struct {
     /// Returns `error.StreamReset` once the client has cancelled, which
     /// unwinds the handler and stops it producing. Handlers that loop over a
     /// large result set get this for free from `try stream.send(...)`.
+    ///
+    /// The check is against state the connection's reader task has already
+    /// recorded, so it reflects a RST_STREAM that arrived at any point — not
+    /// only one noticed because this write happened to block.
     pub fn send(self: *ServerStream, message: []const u8) !void {
-        // Cancellation is noticed when the write path blocks for flow-control
-        // credit and reads the pending RST_STREAM. See "Known constraints" in
-        // the README for why detection is bounded by the peer's window rather
-        // than immediate.
-        if (self.conn.isStreamReset(self.stream_id)) return error.StreamReset;
+        if (self.stream.isReset()) return error.StreamReset;
 
         if (!self.headers_sent) {
-            try self.conn.writeHeaders(self.stream_id, &.{
+            try self.conn.writeHeaders(self.stream.id, &.{
                 .{ .name = ":status", .value = "200" },
                 .{ .name = "content-type", .value = "application/grpc+proto" },
             }, false);
@@ -135,7 +140,7 @@ pub const ServerStream = struct {
         );
         try framing.writeMessage(&writer, message);
 
-        try self.conn.writeData(self.stream_id, self.frame_buf.items, false);
+        try self.conn.writeData(self.stream, self.frame_buf.items, false);
         // Flushed per message on purpose. Letting messages sit until the 64KB
         // write buffer happens to fill would make delivery depend on message
         // size rather than on the handler producing them, which defeats
@@ -272,59 +277,92 @@ pub const Server = struct {
         try self.serveConnection(stream);
     }
 
-    pub fn serveConnection(self: *Server, stream: std.Io.net.Stream) !void {
-        try tcp.setNoDelay(stream);
+    pub fn serveConnection(self: *Server, socket: std.Io.net.Stream) !void {
+        try tcp.setNoDelay(socket);
 
         const read_buf = try self.allocator.alloc(u8, self.options.io_buffer_bytes);
         defer self.allocator.free(read_buf);
         const write_buf = try self.allocator.alloc(u8, self.options.io_buffer_bytes);
         defer self.allocator.free(write_buf);
 
-        var reader = stream.reader(self.io, read_buf);
-        var writer = stream.writer(self.io, write_buf);
+        var reader = socket.reader(self.io, read_buf);
+        var writer = socket.writer(self.io, write_buf);
 
-        var conn = h2.Connection.init(self.allocator, &reader.interface, &writer.interface, true);
+        var conn = h2.Connection.init(
+            self.allocator,
+            self.io,
+            &reader.interface,
+            &writer.interface,
+            true,
+        );
         defer conn.deinit();
 
+        // The preface is read on this task, before the reader starts: it is
+        // not a frame, and letting the frame loop try to parse it would turn a
+        // clear "this is not HTTP/2" into a confusing framing error.
         try conn.readClientPreface();
         try conn.sendSettings();
         try conn.flush();
+        try conn.start();
 
-        while (true) {
-            self.serveOneCall(&conn) catch |err| switch (err) {
-                // A peer that hangs up between calls is the normal way a
-                // connection ends, not an error worth propagating.
-                error.EndOfStream, error.ConnectionClosed, error.ConnectionResetByPeer => return,
-                else => return err,
+        // Declared after `conn` so it is cancelled first: a call task holds a
+        // pointer to the connection.
+        var calls: std.Io.Group = .init;
+        defer calls.cancel(self.io);
+
+        while (try conn.acceptStream()) |stream| {
+            calls.concurrent(self.io, callTask, .{ self, &conn, stream }) catch {
+                // Out of concurrency. Serving inline stops this connection
+                // accepting further streams until the call finishes, which is
+                // the old behaviour and still better than refusing the call.
+                callTask(self, &conn, stream);
             };
-            if (conn.goaway_received != null) return;
         }
+
+        try calls.await(self.io);
     }
 
-    // `anyerror` so the disconnect cases below can be named explicitly;
-    // the inferred set varies with the Io implementation in use.
-    fn serveOneCall(self: *Server, conn: *h2.Connection) anyerror!void {
-        // Wait for the HEADERS frame that starts the next call.
-        const first = while (true) {
-            const frame = try conn.readFrame();
-            switch (frame.header.frame_type) {
-                .HEADERS => break frame,
-                .GOAWAY => return,
-                .RST_STREAM => continue,
-                else => continue,
-            }
+    /// One call. Errors are logged rather than returned: a call is not what
+    /// the connection is waiting on, and one bad call must not close it.
+    fn callTask(self: *Server, conn: *h2.Connection, stream: *h2.Stream) void {
+        defer conn.closeStream(stream);
+
+        self.serveCall(conn, stream) catch |err| switch (err) {
+            // The ordinary ends of a call: the client cancelled, hung up, or
+            // the server is shutting down.
+            error.StreamReset,
+            error.ConnectionClosed,
+            error.EndOfStream,
+            error.Canceled,
+            => {},
+            else => log.warn("call failed: {t}", .{err}),
         };
+    }
 
-        const stream_id = first.header.stream_id;
-        defer conn.releaseStream(stream_id);
-        var headers = try conn.readHeaderBlock(first);
-        defer headers.deinit();
-
+    // `anyerror` so the disconnect cases above can be named explicitly; the
+    // inferred set varies with the Io implementation in use.
+    fn serveCall(self: *Server, conn: *h2.Connection, stream: *h2.Stream) anyerror!void {
         var call_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer call_arena.deinit();
 
+        // Request bytes are read straight into the framing decoder's buffer,
+        // so they are copied once on the way from the transport rather than
+        // staged in between.
+        var decoder = framing.Decoder.init(self.allocator);
+        decoder.max_message_bytes = self.options.max_message_bytes;
+        defer decoder.deinit();
+
+        var headers = switch (try stream.next(try decoder.reserve(recv_chunk))) {
+            .headers => |h| h,
+            // A stream that opens with DATA, or with nothing at all, never
+            // named a method; there is no way to answer it.
+            .data => return error.UnexpectedData,
+            .end => return,
+        };
+        defer headers.deinit();
+
         const path = headers.get(":path") orelse {
-            try self.respondStatusOnly(conn, stream_id, .{
+            try self.respondStatusOnly(conn, stream.id, .{
                 .code = .internal,
                 .message = "missing :path",
             });
@@ -336,16 +374,12 @@ pub const Server = struct {
         else
             null;
 
-        // Collect the request body. END_STREAM on the HEADERS frame means a
-        // zero-length request, which is legal.
-        var decoder = framing.Decoder.init(self.allocator);
-        decoder.max_message_bytes = self.options.max_message_bytes;
-        defer decoder.deinit();
-
+        // END_STREAM on the HEADERS frame means a zero-length request, which
+        // is legal.
         var request_bytes: []const u8 = "";
-        if (!first.header.flags.has(h2.FrameFlags.END_STREAM)) {
-            request_bytes = self.readRequestMessage(conn, stream_id, &decoder, call_arena.allocator()) catch |err| {
-                try self.respondStatusOnly(conn, stream_id, .{
+        if (!headers.end_stream) {
+            request_bytes = self.readRequestMessage(stream, &decoder, call_arena.allocator()) catch |err| {
+                try self.respondStatusOnly(conn, stream.id, .{
                     .code = if (err == error.MessageTooLarge) .resource_exhausted else .internal,
                     .message = @errorName(err),
                 });
@@ -354,7 +388,7 @@ pub const Server = struct {
         }
 
         const handler = self.lookup(path) orelse {
-            try self.respondStatusOnly(conn, stream_id, .{
+            try self.respondStatusOnly(conn, stream.id, .{
                 .code = .unimplemented,
                 .message = "method not found",
             });
@@ -372,38 +406,38 @@ pub const Server = struct {
         switch (handler) {
             .unary => |call| {
                 const response = call(&ctx, request_bytes) catch |err| {
-                    try self.respondStatusOnly(conn, stream_id, failureStatus(&ctx, err));
+                    try self.respondStatusOnly(conn, stream.id, failureStatus(&ctx, err));
                     return;
                 };
 
                 if (!ctx.status.isOk()) {
-                    try self.respondStatusOnly(conn, stream_id, ctx.status);
+                    try self.respondStatusOnly(conn, stream.id, ctx.status);
                     return;
                 }
 
-                try self.respond(conn, stream_id, response, Status.ok);
+                try self.respond(conn, stream, response, Status.ok);
             },
 
             .server_stream => |call| {
-                var stream: ServerStream = .{
+                var out: ServerStream = .{
                     .allocator = self.allocator,
                     .conn = conn,
-                    .stream_id = stream_id,
+                    .stream = stream,
                 };
-                defer stream.deinit();
+                defer out.deinit();
 
-                if (call(&ctx, request_bytes, &stream)) |_| {
-                    try self.finishStream(conn, stream_id, &stream, ctx.status);
+                if (call(&ctx, request_bytes, &out)) |_| {
+                    try self.finishStream(conn, stream, &out, ctx.status);
                 } else |err| {
                     // A client that cancelled has already torn the stream down.
                     // There is nothing to report to and nothing to report — it
                     // is a normal end to the call, not a failure.
-                    if (err == error.StreamReset or conn.isStreamReset(stream_id)) return;
+                    if (err == error.StreamReset or stream.isReset()) return;
 
                     // Once any message has gone out the response headers are
                     // already on the wire, so the failure has to be reported in
                     // trailers rather than as a Trailers-Only response.
-                    try self.finishStream(conn, stream_id, &stream, failureStatus(&ctx, err));
+                    try self.finishStream(conn, stream, &out, failureStatus(&ctx, err));
                 }
             },
         }
@@ -412,57 +446,49 @@ pub const Server = struct {
     fn finishStream(
         self: *Server,
         conn: *h2.Connection,
-        stream_id: u32,
-        stream: *ServerStream,
+        stream: *h2.Stream,
+        out: *ServerStream,
         call_status: Status,
     ) !void {
-        if (!stream.headers_sent) {
+        if (!out.headers_sent) {
             // A stream that produced nothing collapses to Trailers-Only, which
             // is legal for both an empty success and an early failure.
-            try self.respondStatusOnly(conn, stream_id, call_status);
+            try self.respondStatusOnly(conn, stream.id, call_status);
             return;
         }
-        try self.writeTrailers(conn, stream_id, call_status);
+        try self.writeTrailers(conn, stream.id, call_status);
         try conn.flush();
     }
 
     fn readRequestMessage(
         self: *Server,
-        conn: *h2.Connection,
-        stream_id: u32,
+        stream: *h2.Stream,
         decoder: *framing.Decoder,
         arena: std.mem.Allocator,
     ) ![]const u8 {
         _ = self;
         while (true) {
-            const frame = try conn.readFrame();
-            const mine = frame.header.stream_id == stream_id;
-
-            switch (frame.header.frame_type) {
-                .DATA => {
-                    if (!mine) continue;
-                    try decoder.push(h2.dataPayload(frame));
+            switch (try stream.next(try decoder.reserve(recv_chunk))) {
+                .data => |n| {
+                    decoder.commit(n);
                     if (try decoder.next()) |msg| {
-                        // Copy out: the decoder's buffer is reused, and the
+                        if (msg.compressed) return error.CompressionNotSupported;
+                        // Copied out: the decoder's buffer is reused, and the
                         // handler may hold this for the whole call.
                         return try arena.dupe(u8, msg.payload);
                     }
-                    if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) {
-                        if (decoder.isDrained()) return "";
-                        return error.TruncatedMessage;
-                    }
                 },
                 // Trailing HEADERS from the client ends the request stream.
-                // Decoded unconditionally: HPACK's dynamic table is
-                // connection-wide, so a skipped block corrupts later ones.
-                .HEADERS => {
-                    var headers = try conn.readHeaderBlock(frame);
-                    headers.deinit();
-                    if (mine and frame.header.flags.has(h2.FrameFlags.END_STREAM)) return "";
+                .headers => |h| {
+                    var trailers = h;
+                    trailers.deinit();
                 },
-                .RST_STREAM => if (mine) return error.StreamReset,
-                .GOAWAY => return error.ConnectionClosed,
-                else => {},
+                .end => {
+                    // A stream that ends mid-message was truncated; reporting
+                    // it as an empty request would silently lose data.
+                    if (decoder.isDrained()) return "";
+                    return error.TruncatedMessage;
+                },
             }
         }
     }
@@ -485,11 +511,11 @@ pub const Server = struct {
     fn respond(
         self: *Server,
         conn: *h2.Connection,
-        stream_id: u32,
+        stream: *h2.Stream,
         message: []const u8,
         call_status: Status,
     ) !void {
-        try conn.writeHeaders(stream_id, &.{
+        try conn.writeHeaders(stream.id, &.{
             .{ .name = ":status", .value = "200" },
             .{ .name = "content-type", .value = "application/grpc+proto" },
         }, false);
@@ -503,8 +529,8 @@ pub const Server = struct {
         var body_writer = std.Io.Writer.fixed(try body.addManyAsSlice(self.allocator, needed));
         try framing.writeMessage(&body_writer, message);
 
-        try conn.writeData(stream_id, body.items, false);
-        try self.writeTrailers(conn, stream_id, call_status);
+        try conn.writeData(stream, body.items, false);
+        try self.writeTrailers(conn, stream.id, call_status);
         try conn.flush();
     }
 

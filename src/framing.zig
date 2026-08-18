@@ -86,8 +86,30 @@ pub const Decoder = struct {
     /// Feeds a chunk of stream bytes. Invalidates any payload previously
     /// returned by `next`.
     pub fn push(self: *Decoder, chunk: []const u8) !void {
+        const dest = try self.reserve(chunk.len);
+        @memcpy(dest[0..chunk.len], chunk);
+        self.commit(chunk.len);
+    }
+
+    /// Writable space at the end of the buffer, at least `n` bytes of it, for
+    /// a caller that can fill it directly. Whatever is written must be handed
+    /// back with `commit`.
+    ///
+    /// This exists so bytes arriving off the transport land in the decoder's
+    /// buffer in one copy instead of two — the difference between three copies
+    /// and four on the path from socket to handler.
+    ///
+    /// Invalidates any payload previously returned by `next`.
+    pub fn reserve(self: *Decoder, n: usize) ![]u8 {
         self.compact();
-        try self.buf.appendSlice(self.allocator, chunk);
+        try self.buf.ensureUnusedCapacity(self.allocator, n);
+        return self.buf.unusedCapacitySlice();
+    }
+
+    /// Accepts `n` bytes written into the slice from `reserve`.
+    pub fn commit(self: *Decoder, n: usize) void {
+        std.debug.assert(n <= self.buf.capacity - self.buf.items.len);
+        self.buf.items.len += n;
     }
 
     /// Returns the next complete message, or null if more bytes are needed.

@@ -5,11 +5,11 @@
 Real gRPC over HTTP/2 (h2c) for Zig — actual wire protocol, verified against
 the reference `grpc-go` implementation.
 
-Status: **unary and server streaming work end to end** and interoperate with
-grpc-go (milestones 1 and 3).
+Status: **unary and server streaming work end to end**, concurrently, and
+interoperate with grpc-go (milestones 1 and 3).
 
 ```
-zig build test              # unit + integration tests (73)
+zig build test              # unit + integration tests (75)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency baseline
@@ -41,8 +41,9 @@ try server.serve();
 ```
 
 `serve` accepts until cancelled and gives each connection its own unit of
-concurrency. `acceptAndServe` handles a single connection on the calling task,
-for callers that want to drive the accept loop themselves.
+concurrency, and each call on it another. `acceptAndServe` handles a single
+connection on the calling task, for callers that want to drive the accept loop
+themselves. See "Concurrency" below.
 
 Client:
 
@@ -150,7 +151,8 @@ library's own cost with network RTT removed. It is a floor, not a prediction:
 the milestone-2 number has to come from the real VPC, where same-AZ vs
 cross-AZ RTT dominates the ~5ms budget.
 
-Current numbers (Raspberry Pi 5, loopback, ReleaseFast):
+Reference numbers (Raspberry Pi 5, loopback, ReleaseFast, idle machine), taken
+on the single-task-per-connection transport that preceded the concurrent one:
 
 ```
      64 B  n=10000   mean    18.6us  p50    18.5us  p99   21.1us  p999    32.5us
@@ -158,6 +160,44 @@ Current numbers (Raspberry Pi 5, loopback, ReleaseFast):
   16384 B  n=10000   mean    41.7us  p50    44.6us  p99   71.9us  p999   273.4us
  131072 B  n= 2000   mean   342.8us  p50   318.1us  p99  658.1us  p999  1379.5us
 ```
+
+### What concurrency cost
+
+The dedicated reader task (see "Concurrency") puts a thread handoff in the
+middle of every call: the reply is parsed by the connection's reader and the
+caller is woken to collect it. That is not free, and it was measured rather
+than assumed — old transport and new, built from the same tree and run
+back to back:
+
+```
+                 p50 before   p50 after
+     64 B            17.8us      29.0us
+   1024 B            18.2us      31.0us
+  16384 B            45.0us      55.0us
+ 131072 B           360.0us     530.0us
+```
+
+About 11µs of that is one context switch, and it is the price of the whole
+feature: concurrent calls and cancellation that does not wait for a window to
+close. Against a ~5ms in-VPC budget it is 0.2%. The 128KB gap is larger
+because a multi-frame message crosses the handoff several times.
+
+Two things were found chasing it, both worth more than the handoff itself:
+
+* **Wakeups were being spent three-to-a-call.** A unary response is HEADERS,
+  DATA and trailers, written with one flush and therefore read in one go — but
+  the reader woke the caller after each frame. Deferring wakeups until the
+  reader is actually about to block on the socket collapses them into one, and
+  took the 64-byte p99 from ~610µs to ~230µs.
+* **The per-stream receive buffer compacted on every read**, making a message
+  that spans many frames quadratic in its own size. Consumed space is now
+  reclaimed by the append that needs the room.
+
+These numbers are an A/B, not a result: the machine had a browser on it and
+its load shows in every tail figure — the *old* code measured p999 609µs to
+2.1ms on the same runs, against the 32.5µs in the table above. The table stands
+as the last clean measurement; a clean re-measurement on an idle machine is
+owed before any of it is quoted.
 
 Getting there found a real bug worth recording, because it is exactly the kind
 of tail problem the project brief warns about — and it was *not* the HTTP/2
@@ -185,49 +225,75 @@ here.
 The benchmark also deliberately avoids `DebugAllocator`, which captures a stack
 trace per allocation and on ARM costs more than the RPC being measured.
 
+### Flow-control windows
+
+We advertise a 256KB stream window and raise the connection window to 1MB,
+rather than living with HTTP/2's 65,535-byte default. The default is a latency
+bug at any real bandwidth: a sender may have only that much in flight before it
+must stop and wait for credit, so once bandwidth times round-trip exceeds it,
+every message larger than the window costs an extra round trip. In-VPC at
+10Gbps the bandwidth-delay product is around half a megabyte — the default
+misses it by an order of magnitude.
+
+The connection window cannot be set in SETTINGS; RFC 9113 6.9.2 fixes its
+initial value and only a WINDOW_UPDATE on stream 0 moves it, so that frame goes
+out alongside our SETTINGS.
+
+The cost is memory, and it is deliberate: the connection window is exactly the
+bound on what a peer can make one connection buffer before we have consumed any
+of it. Multiplied by `Server.Options.max_concurrent_connections`, it is the
+server's worst case. Credit is returned when a caller *consumes* bytes, not
+when they arrive — returning it on arrival, as an earlier version did, means
+there is no bound at all.
+
+## Concurrency
+
+Three levels, each on its own unit of concurrency:
+
+* **A connection per accept.** `serve` spawns each accepted connection and
+  keeps accepting. Bounded by `Options.max_concurrent_connections`.
+* **A reader per connection.** One task owns the read side and does nothing
+  else: it pulls frames off the socket, decodes header blocks, and files
+  everything into per-stream mailboxes. Callers never read from the socket.
+* **A call per stream.** Each stream the peer opens is handled on its own task,
+  so a handler that is slow, blocked, or streaming a million rows holds up
+  nothing but itself. Clients get the same thing from the other side: `call`
+  may be invoked from several tasks on one `Client`, and the calls multiplex.
+
+Writers take a separate lock from connection state and the two are never held
+at once, so a writer blocked in `flush` cannot stall frame processing — which
+is what would deadlock against a peer that is itself blocked writing to us.
+
+A dedicated reader is what makes cancellation prompt. When the writer drove the
+reader, a RST_STREAM sat unread until the writer next happened to block for
+flow-control credit, so a server noticed a cancelled call only as promptly as
+the peer's window was small — and grpc-go grows windows dynamically. Now the
+frame is seen on arrival and the next `stream.send` fails, whatever the window
+is doing.
+
+The one rule the structure exists to keep is that a connection's header blocks
+are decoded on exactly one task. `Hpack.decodeHeaderFieldView` in the
+dependency calls `ScratchBuffer.reset()` on entry and returns slices into that
+buffer, which is `threadlocal`; its dynamic table is connection-wide ordered
+state. So different threads decoding concurrently are fine, and two of one
+connection's blocks interleaved on a single thread are not. Decoding lives in
+the reader task alone, which settles it — and `src/h2.zig` still copies each
+header into an arena before decoding the next, because a lazy copy would
+corrupt all but the last.
+
 ## Known constraints
-
-**One call at a time per connection.** `serve` runs each connection on its own
-unit of concurrency, so connections do not block each other, but a connection
-handles its calls in sequence. A client that opens a second stream while the
-first is still running gets it served after, not alongside. Fixing that needs
-the same restructuring as prompt cancellation, below.
-
-The HPACK decoder in the dependency constrains how far that can go.
-`Hpack.decodeHeaderFieldView` calls `ScratchBuffer.reset()` on entry and
-returns slices into that buffer, which is `threadlocal` — so different threads
-decoding concurrently are fine, and two header blocks interleaved *on one
-thread* are not. Two consequences:
-
-1. `src/h2.zig` copies every header into an arena immediately after decoding
-   it, before decoding the next — a lazy copy would silently corrupt all but
-   the last header.
-2. A connection's frames must be decoded on one task from end to end, which is
-   what `serve` guarantees. Decoding several connections' header blocks on a
-   shared worker would need a per-connection decoder upstream, or a lock.
-
-**Stream cancellation is bounded by flow control, not immediate.** A client
-that abandons a stream sends RST_STREAM and stops replenishing that stream's
-flow-control window; the server notices when its write path next blocks for
-credit, and `stream.send` then returns `error.StreamReset`, unwinding the
-handler. This works, but detection is only as prompt as the window is small: a
-peer that advertises large or dynamically-grown windows (grpc-go does) can let
-a server produce well past the point of cancellation before it blocks and
-looks.
-
-Making it immediate needs the transport to read frames while it is writing,
-which the current single-task-per-connection design cannot do. A non-blocking `poll` before each
-send was tried and removed: `std.Io.net.Stream.Reader` latches its error state,
-so one failed `fillMore` poisons the reader and every later read fails with
-`error.ReadFailed`. The real fix is a reader that is not driven by the writer —
-the same restructuring the per-connection call limit above needs.
 
 **No compression.** The compressed-message flag is parsed and rejected;
 `grpc-encoding` is not negotiated.
 
-**Flow control is connection- and stream-level, but there is no stream
-concurrency limit.** `SETTINGS_MAX_CONCURRENT_STREAMS` from the peer is parsed
-and ignored, which is safe only because the client issues one call at a time.
+**Flow-control windows are fixed, not adaptive.** 256KB per stream and 1MB per
+connection, chosen for an in-VPC round trip and never adjusted. grpc-go
+estimates the bandwidth-delay product and grows its windows to match; a link
+much faster or much slower than assumed will not get the same treatment here.
+
+**No deadline enforcement on the server.** `grpc-timeout` is decoded and handed
+to the handler as `ctx.deadline_ns`, but nothing cancels a handler that runs
+past it. Handlers that care must check it themselves.
 
 **h2c only, no TLS.** Per the project constraint that all consumers are inside
 one trusted VPC. There is no ALPN, so this cannot talk to a TLS gRPC endpoint.
@@ -239,9 +305,11 @@ This is the check that matters for "must be real gRPC on the wire" — our own
 client agreeing with our own server proves only self-consistency. It covers
 the unary happy path, empty messages, messages spanning many DATA frames and
 exceeding the flow-control window, non-OK status codes with messages, unknown
-methods, connection reuse across calls, and server streaming — ordered
-delivery, empty streams, long streams, and a mid-stream failure whose status
-must arrive in trailers after the messages already sent.
+methods, connection reuse across calls, server streaming — ordered delivery,
+empty streams, long streams, and a mid-stream failure whose status must arrive
+in trailers after the messages already sent — and eight concurrent RPCs
+multiplexed over the one connection grpc-go keeps open, timed to prove they
+overlap rather than queue.
 
 Bugs found this way that the internal tests missed:
 
@@ -259,15 +327,21 @@ desynchronised HPACK. The dynamic table is connection-wide state built by every
 header block in order, so a skipped block corrupts every later one. Header
 blocks are now always decoded, even when discarded.
 
+Making the transport concurrent surfaced two of its own, both found by
+benchmarking rather than by a test — see "What concurrency cost": wakeups spent
+three to a call, and a per-stream receive buffer that compacted on every read
+and so was quadratic in message size.
+
 ## Layout
 
 ```
-src/h2.zig               HTTP/2 connection driver (frames + HPACK from http2.zig)
+src/h2.zig               HTTP/2 connection driver: reader task, per-stream
+                         mailboxes, flow control (frames + HPACK from http2.zig)
 src/framing.zig          gRPC 5-byte length-prefixed message framing
 src/status.zig           grpc-status codes, percent-encoded grpc-message
 src/timeout.zig          grpc-timeout deadline encoding
-src/client.zig           unary + server-streaming client
-src/server.zig           unary + server-streaming server
+src/client.zig           unary + server-streaming client, concurrent calls
+src/server.zig           unary + server-streaming server, task per call
 src/tcp.zig              TCP_NODELAY
 src/integration_test.zig end-to-end tests over loopback
 examples/echo_server.zig standalone server (interop target)

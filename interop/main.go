@@ -285,6 +285,46 @@ func main() {
 		return nil
 	}())
 
+	// 11. Concurrent RPCs multiplexed over the one connection grpc-go keeps
+	//     open. Each handler sleeps 300ms, so eight of them served in
+	//     sequence would take 2.4s and served at once take about 300ms. The
+	//     bound is set well between the two: this is a check that the streams
+	//     genuinely overlap, not a benchmark.
+	check("concurrent streams multiplex over one connection", func() error {
+		const concurrency = 8
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		errs := make(chan error, concurrency)
+		started := time.Now()
+		for i := 0; i < concurrency; i++ {
+			go func(i int) {
+				payload := []byte(fmt.Sprintf("call-%d", i))
+				resp, err := call(ctx, "/zgrpc.test.Echo/Slow", payload)
+				if err != nil {
+					errs <- err
+					return
+				}
+				// Also proves responses are not crossed between streams.
+				if string(resp) != string(payload) {
+					errs <- fmt.Errorf("got %q, want %q", resp, payload)
+					return
+				}
+				errs <- nil
+			}(i)
+		}
+		for i := 0; i < concurrency; i++ {
+			if err := <-errs; err != nil {
+				return err
+			}
+		}
+
+		if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+			return fmt.Errorf("%d concurrent calls took %v; served sequentially", concurrency, elapsed)
+		}
+		return nil
+	}())
+
 	failed := 0
 	for _, r := range results {
 		if r.err != nil {

@@ -132,11 +132,32 @@ BoringSSL TLS targets; the `http2` module itself is BoringSSL-free.
 `CallContext` carrying the per-call arena, path, deadline and settable status.
 Protobuf codegen sits above the transport rather than inside it.
 
+**Concurrency model**: a unit of concurrency per connection, per connection a
+reader task that owns the read side, and per stream a task running the call.
+Writers take a separate lock from connection state and the two are never held
+at once, so a blocked `flush` cannot stall frame processing. A connection's
+header blocks are decoded only on its reader task — upstream's HPACK scratch
+buffer is `threadlocal` (not process-wide, as previously recorded here), so
+concurrency across connections is safe and interleaving within one is not.
+Measured cost: about 11us of p50 per call for the thread handoff, against a
+~5ms budget. Full numbers and the two bugs it flushed out in README "Latency".
+
+**Flow-control windows**: 256KB per stream, 1MB per connection (raised by a
+WINDOW_UPDATE on stream 0, since SETTINGS cannot set it). Credit is returned on
+consumption, not arrival — the connection window is then the bound on what a
+peer can make one connection buffer.
+
 **Server streaming (milestone 3) is done**: `Method.serverStream` +
 `ServerStream.send` on the server, `callServerStream` + `ResponseStream.next`
 on the client, verified against grpc-go. Messages are not buffered whole at
 either end.
 
-Still open: connection pooling / concurrency model, the milestone-2 in-VPC
-benchmark numbers, and prompt stream cancellation (currently bounded by the
-peer's flow-control window — see README "Known constraints").
+Prompt stream cancellation is done: the reader task records RST_STREAM on
+arrival, so `stream.send` fails at the next message whatever the flow-control
+window is doing. Verified by an integration test in which the handler is parked
+with a wide-open window.
+
+Still open: connection pooling (the client is still one connection per
+`Client`), the milestone-2 in-VPC benchmark numbers, and a clean loopback
+re-measurement — the last one was taken on a loaded machine and only the A/B
+between old and new transports is trustworthy.

@@ -1,9 +1,11 @@
-//! Unary gRPC client over h2c.
+//! gRPC client over h2c: unary and server-streaming calls.
 //!
 //! The connection is long-lived by design: gRPC's whole latency argument rests
 //! on reusing one HTTP/2 connection across calls, so nothing here reconnects
-//! per request. `call` may be invoked repeatedly on the same `Client`.
-
+//! per request. `call` may be invoked repeatedly on the same `Client`, and —
+//! since the connection's frames are read by its own task in `h2.zig` — from
+//! several tasks at once. Concurrent calls multiplex over the one connection,
+//! which is the point of HTTP/2.
 const std = @import("std");
 const h2 = @import("h2.zig");
 const framing = @import("framing.zig");
@@ -13,6 +15,10 @@ const tcp = @import("tcp.zig");
 
 const Status = status.Status;
 const Code = status.Code;
+
+/// How much room to offer the transport for each read: one max-size HTTP/2
+/// frame.
+const recv_chunk = h2.default_max_frame_size;
 
 pub const Options = struct {
     max_message_bytes: u32 = framing.default_max_message_bytes,
@@ -46,18 +52,18 @@ pub const Response = struct {
 /// the full response. That is the point of the type — a range query over a
 /// large window must not require the client to hold every row at once.
 ///
-/// The stream borrows its `Client` and holds the connection for the duration of
-/// the call, so it must be drained (or deinited) before another call is made on
-/// the same client.
+/// The stream borrows its `Client`, but no longer monopolises it: other calls
+/// on the same client run alongside this one. It must still be deinited, which
+/// is what cancels the call if it is abandoned part-way.
 pub const ResponseStream = struct {
     client: *Client,
-    stream_id: u32,
+    stream: *h2.Stream,
     decoder: framing.Decoder,
     /// Owns only the final status message, not the yielded payloads.
     arena: std.heap.ArenaAllocator,
 
     call_status: ?Status = null,
-    /// Set once END_STREAM has been seen; no more frames belong to this call.
+    /// Set once END_STREAM has been seen; nothing further belongs to this call.
     ended: bool = false,
 
     /// Ends the call. A stream abandoned before the server finished is
@@ -65,16 +71,8 @@ pub const ResponseStream = struct {
     /// producing — a caller that reads the first few rows of a long range
     /// query and walks away should not leave the server streaming the rest
     /// into a connection nobody is reading.
-    ///
-    /// Errors are swallowed: deinit runs on cleanup paths where there is
-    /// nothing useful to do with a failure, and the connection is already
-    /// suspect if this cannot be written.
     pub fn deinit(self: *ResponseStream) void {
-        if (!self.ended) {
-            self.client.conn.sendRstStream(self.stream_id, h2.error_code_cancel) catch {};
-            self.client.conn.flush() catch {};
-        }
-        self.client.conn.releaseStream(self.stream_id);
+        self.client.conn.closeStream(self.stream);
         self.decoder.deinit();
         self.arena.deinit();
     }
@@ -103,50 +101,42 @@ pub const ResponseStream = struct {
         }
     }
 
-    /// Reads one frame belonging to this call and applies it.
+    /// Takes one event off the stream and applies it. Response bytes land
+    /// directly in the decoder's buffer.
     fn pump(self: *ResponseStream) !void {
-        const conn = &self.client.conn;
-        const frame = try conn.readFrame();
-        const mine = frame.header.stream_id == self.stream_id;
-
-        switch (frame.header.frame_type) {
-            .HEADERS => {
-                // Decoded even when the block belongs to another stream.
-                // HPACK's dynamic table is connection-wide state built by
-                // every header block in order, so skipping one leaves the
-                // decoder permanently out of step with the peer's encoder and
-                // corrupts every later block on the connection.
-                var headers = try conn.readHeaderBlock(frame);
+        switch (try self.stream.next(try self.decoder.reserve(recv_chunk))) {
+            .headers => |h| {
+                var headers = h;
                 defer headers.deinit();
-                if (!mine) return;
-
-                if (headers.get("grpc-status")) |code_text| {
-                    const code = try Code.fromTrailer(code_text);
-                    const raw = headers.get("grpc-message") orelse "";
-                    self.call_status = .{
-                        .code = code,
-                        .message = try status.decodeMessage(self.arena.allocator(), raw),
-                    };
-                } else if (headers.get(":status")) |http_status| {
-                    // A non-200 means the request never reached gRPC at all.
-                    if (!std.mem.eql(u8, http_status, "200")) {
-                        self.call_status = .{
-                            .code = .unavailable,
-                            .message = try self.arena.allocator().dupe(u8, http_status),
-                        };
-                    }
-                }
-
-                if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) self.ended = true;
+                try self.applyHeaders(&headers);
+                if (headers.end_stream) self.ended = true;
             },
-            .DATA => {
-                if (!mine) return;
-                try self.decoder.push(h2.dataPayload(frame));
-                if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) self.ended = true;
-            },
-            .RST_STREAM => if (mine) return error.StreamReset,
-            .GOAWAY => return error.ConnectionClosed,
-            else => {},
+            .data => |n| self.decoder.commit(n),
+            .end => self.ended = true,
+        }
+    }
+
+    /// A header block carrying grpc-status is the trailer block — or, for an
+    /// empty response, a Trailers-Only block that is both first and last.
+    fn applyHeaders(self: *ResponseStream, headers: *const h2.Headers) !void {
+        const arena = self.arena.allocator();
+
+        if (headers.get("grpc-status")) |code_text| {
+            self.call_status = .{
+                .code = try Code.fromTrailer(code_text),
+                .message = try status.decodeMessage(arena, headers.get("grpc-message") orelse ""),
+            };
+            return;
+        }
+
+        // A non-200 means the request never reached gRPC at all.
+        if (headers.get(":status")) |http_status| {
+            if (!std.mem.eql(u8, http_status, "200")) {
+                self.call_status = .{
+                    .code = .unavailable,
+                    .message = try arena.dupe(u8, http_status),
+                };
+            }
         }
     }
 
@@ -214,7 +204,7 @@ pub const Client = struct {
             .allocator = allocator,
             .io = io,
             .stream = stream,
-            .conn = h2.Connection.init(allocator, &reader.interface, &writer.interface, false),
+            .conn = h2.Connection.init(allocator, io, &reader.interface, &writer.interface, false),
             .options = options,
             .authority = authority,
             .read_buf = read_buf,
@@ -225,10 +215,15 @@ pub const Client = struct {
 
         try self.conn.sendClientPreface();
         try self.conn.flush();
+        // Only now, with the client at its final address: the reader task
+        // holds a pointer to `self.conn`.
+        try self.conn.start();
         return self;
     }
 
     pub fn deinit(self: *Client) void {
+        // GOAWAY before shutting the reader down, so the server sees an
+        // orderly end rather than a socket that stopped answering.
         self.conn.sendGoAway(0, h2.error_code_no_error) catch {};
         self.conn.flush() catch {};
         self.conn.deinit();
@@ -248,9 +243,9 @@ pub const Client = struct {
         request: []const u8,
         call_options: CallOptions,
     ) !Response {
-        const stream_id = try self.sendRequest(path, request, call_options);
-        defer self.conn.releaseStream(stream_id);
-        return self.readResponse(stream_id);
+        const stream = try self.sendRequest(path, request, call_options);
+        defer self.conn.closeStream(stream);
+        return self.readResponse(stream);
     }
 
     /// Starts a server-streaming call: send a single message, then read
@@ -265,10 +260,12 @@ pub const Client = struct {
         request: []const u8,
         call_options: CallOptions,
     ) !ResponseStream {
-        const stream_id = try self.sendRequest(path, request, call_options);
+        const stream = try self.sendRequest(path, request, call_options);
+        errdefer self.conn.closeStream(stream);
+
         return .{
             .client = self,
-            .stream_id = stream_id,
+            .stream = stream,
             .decoder = decoder: {
                 var d = framing.Decoder.init(self.allocator);
                 d.max_message_bytes = self.options.max_message_bytes;
@@ -278,16 +275,14 @@ pub const Client = struct {
         };
     }
 
-    /// Writes request HEADERS plus the single request message, and returns the
-    /// stream id the response will arrive on.
+    /// Opens a stream with the request HEADERS and writes the single request
+    /// message on it.
     fn sendRequest(
         self: *Client,
         path: []const u8,
         request: []const u8,
         call_options: CallOptions,
-    ) !u32 {
-        const stream_id = self.conn.openStream();
-
+    ) !*h2.Stream {
         var timeout_buf: [16]u8 = undefined;
         const timeout_text: ?[]const u8 = if (call_options.deadline_ns) |ns|
             try timeout.encode(&timeout_buf, ns)
@@ -316,7 +311,8 @@ pub const Client = struct {
             n += 1;
         }
 
-        try self.conn.writeHeaders(stream_id, fields[0..n], false);
+        const stream = try self.conn.openStream(fields[0..n], false);
+        errdefer self.conn.closeStream(stream);
 
         // Frame the request into one buffer so headers and body leave in as
         // few writes as possible.
@@ -326,13 +322,13 @@ pub const Client = struct {
         var body_writer = std.Io.Writer.fixed(try body.addManyAsSlice(self.allocator, needed));
         try framing.writeMessage(&body_writer, request);
 
-        try self.conn.writeData(stream_id, body.items, true);
+        try self.conn.writeData(stream, body.items, true);
         try self.conn.flush();
 
-        return stream_id;
+        return stream;
     }
 
-    fn readResponse(self: *Client, stream_id: u32) !Response {
+    fn readResponse(self: *Client, stream: *h2.Stream) !Response {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
@@ -345,54 +341,44 @@ pub const Client = struct {
         var got_message = false;
         var call_status: ?Status = null;
 
-        while (true) {
-            const frame = try self.conn.readFrame();
-            const mine = frame.header.stream_id == stream_id;
-
-            switch (frame.header.frame_type) {
-                .HEADERS => {
-                    // Decoded even for other streams: HPACK's dynamic table is
-                    // connection-wide, so skipping a block desynchronizes the
-                    // decoder from the peer's encoder for good.
-                    var headers = try self.conn.readHeaderBlock(frame);
+        done: while (true) {
+            switch (try stream.next(try decoder.reserve(recv_chunk))) {
+                .headers => |h| {
+                    var headers = h;
                     defer headers.deinit();
-                    if (!mine) continue;
 
                     // A header block carrying grpc-status is the trailer block
                     // — or, for an empty response, a Trailers-Only block that
                     // is simultaneously the first and last.
                     if (headers.get("grpc-status")) |code_text| {
-                        const code = try Code.fromTrailer(code_text);
-                        const raw_message = headers.get("grpc-message") orelse "";
-                        const decoded = try status.decodeMessage(arena_alloc, raw_message);
-                        call_status = .{ .code = code, .message = decoded };
-                    } else {
-                        // A non-200 means the request never reached gRPC at all.
-                        if (headers.get(":status")) |http_status| {
-                            if (!std.mem.eql(u8, http_status, "200")) {
-                                call_status = .{
-                                    .code = .unavailable,
-                                    .message = try arena_alloc.dupe(u8, http_status),
-                                };
-                            }
+                        call_status = .{
+                            .code = try Code.fromTrailer(code_text),
+                            .message = try status.decodeMessage(
+                                arena_alloc,
+                                headers.get("grpc-message") orelse "",
+                            ),
+                        };
+                    } else if (headers.get(":status")) |http_status| {
+                        // A non-200 means the request never reached gRPC.
+                        if (!std.mem.eql(u8, http_status, "200")) {
+                            call_status = .{
+                                .code = .unavailable,
+                                .message = try arena_alloc.dupe(u8, http_status),
+                            };
                         }
                     }
 
-                    if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) break;
+                    if (headers.end_stream) break :done;
                 },
-                .DATA => {
-                    if (!mine) continue;
-                    try decoder.push(h2.dataPayload(frame));
+                .data => |n| {
+                    decoder.commit(n);
                     while (try decoder.next()) |msg| {
                         if (msg.compressed) return error.CompressionNotSupported;
                         message = try arena_alloc.dupe(u8, msg.payload);
                         got_message = true;
                     }
-                    if (frame.header.flags.has(h2.FrameFlags.END_STREAM)) break;
                 },
-                .RST_STREAM => if (mine) return error.StreamReset,
-                .GOAWAY => return error.ConnectionClosed,
-                else => {},
+                .end => break :done,
             }
         }
 
