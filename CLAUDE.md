@@ -218,3 +218,24 @@ Next up:
   check ahead of the VPC run. Not the milestone-2 number.
 - Make `vpc/README.md` cloud-neutral (it says "security group", "AZ"); it was
   written assuming AWS, and where the TSDB consumer runs is not yet recorded.
+
+Found by reading the source (not exploited), in the order to do them:
+- Cap an accumulating header block: `readHeaderBlock` (h2.zig) follows
+  CONTINUATION frames without limit. Also reject frames over the advertised
+  `SETTINGS_MAX_FRAME_SIZE` (16384; `readFrame` accepts up to 16MB), advertise
+  and enforce `SETTINGS_MAX_HEADER_LIST_SIZE`, and bound HEADERS frames per
+  stream. Write the failing tests first.
+- Keepalive and idle timeout: nothing sends PING and there is no
+  `SO_KEEPALIVE`, so a vanished client holds one of the 128 connection slots
+  forever. `deadline_ns` defaulting to null means a call can wait forever on a
+  half-open connection.
+- Graceful server shutdown: `Server.deinit` cancels connections and the server
+  never sends GOAWAY, so in-flight calls are cut.
+- Custom metadata: `CallOptions` carries only a deadline, so a client cannot
+  send auth or trace headers, and a handler cannot set response headers or
+  trailers beyond status. Check whether the TSDB needs this before it depends
+  on us.
+- Smaller: handler errors reach the caller as `@errorName(err)`; compression
+  is unsupported (`CompressionNotSupported`); no metrics or logging hooks.
+- Not yet checked: rapid-reset behaviour under load, since stream handlers are
+  launched before a RST_STREAM can cancel them.
