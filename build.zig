@@ -72,6 +72,22 @@ pub fn build(b: *std.Build) void {
     const bench_build_step = b.step("bench-build", "Compile the benchmark without running it");
     bench_build_step.dependOn(&bench_install.step);
 
+    // The milestone-2 pair: run `vpc_server` on one host and `vpc_bench` on
+    // another. Cross-compile with -Dtarget= and copy the binaries over.
+    const vpc_step = b.step("vpc", "Build the in-VPC benchmark binaries (vpc_server, vpc_bench)");
+    for ([_][]const u8{ "vpc_server", "vpc_bench" }) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{.{ .name = "zgrpc", .module = mod }},
+            }),
+        });
+        vpc_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);

@@ -279,6 +279,7 @@ src/tcp.zig              TCP_NODELAY
 src/integration_test.zig end-to-end tests over loopback
 examples/echo_server.zig standalone server (interop target)
 examples/bench.zig       loopback latency and pool throughput
+examples/vpc_*.zig      two-host benchmark for milestone 2 (see vpc/)
 interop/                 grpc-go interop suite
 packaging/               proof that it works as a published dependency
 ```

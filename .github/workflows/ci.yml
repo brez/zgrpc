@@ -55,6 +55,9 @@ jobs:
         # assert on, but the code should still be kept compiling.
         run: zig build bench-build
 
+      - name: Compile VPC benchmark
+        run: zig build vpc
+
   package:
     name: consumable as a dependency
     runs-on: ubuntu-latest
