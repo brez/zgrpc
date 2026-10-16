@@ -22,6 +22,22 @@ on the single-task-per-connection transport that preceded the concurrent one:
  131072 B  n= 2000   mean   342.8us  p50   318.1us  p99  658.1us  p999  1379.5us
 ```
 
+Current numbers, same machine, concurrent transport, quiet (browsers closed,
+load average under 0.5 at start; three consecutive runs, range shown):
+
+```
+     64 B  p50  25.6-27.5us  p99  30.4-37.3us  p999   74.5-215.0us
+   1024 B  p50  27.3-28.2us  p99  40.8-71.9us  p999  591.2-985.6us
+  16384 B  p50  46.7-49.8us  p99  90.3-128.6us p999 485.5-1554.5us
+ 131072 B  p50 396.7-418.6us p99 1096-1576us   p999 3888-5270us
+```
+
+p50 is stable to a few percent; p99 and especially p999 are not, and one run's
+tail should not be quoted. The governor was still `ondemand`, not `performance`.
+These p50s run 3-4us under the "after" column in the next section (25.6us vs
+29.0us at 64 B, 27.3us vs 31.0us at 1 KB), so the handoff cost there, measured
+loaded, was overstated: about 8us over the old transport, not 11.
+
 ### What concurrency cost
 
 The dedicated reader task (see "Concurrency") puts a thread handoff in the
@@ -164,17 +180,17 @@ whatever the ceiling is.
 Measured on loopback (`zig build bench`, "under load", 1KB payload):
 
 ```
-   callers 8    pool 1   p50   161.5us  p99  3081.7us   25543 calls/s
-   callers 8    pool 4   p50   106.5us  p99  2467.3us   34240 calls/s
-   callers 64   pool 1   p50  2230.1us  p99 13630.0us   19841 calls/s
-   callers 64   pool 4   p50  1563.9us  p99 13321.9us   26019 calls/s
+   callers 8    pool 1   p50   116-119us  p99   298-380us   p999 1.6-2.0ms   58-61k calls/s
+   callers 8    pool 4   p50    86-89us   p99   193-424us   p999 1.1-3.2ms   71-81k calls/s
+   callers 64   pool 1   p50  1274-1289us p99  5.5-5.8ms    p999 8.5-10.6ms  49-51k calls/s
+   callers 64   pool 4   p50   735-757us  p99  3.3-3.6ms    p999 5.3-6.0ms   69-71k calls/s
 ```
 
-About 30% more throughput and 30% off p50 at both concurrency levels, which is
+Pool 4 over pool 1: +25-37% throughput and 27-42% off p50 at both concurrency
+levels (the earlier loaded figures said ~30% for both), which is
 where the default ceiling of 4 comes from. It is a property of the machine —
 one reader task per connection, so the useful ceiling tracks cores — and worth
-re-measuring on the target host. Same caveat as everything else here: the
-machine was loaded, so read the ratios and not the absolute figures.
+re-measuring on the target host. Measured on a quiet machine (three runs).
 
 A connection the peer has closed or sent GOAWAY on is retired at the next call
 and replaced. Retirement is not cancellation: calls already running on it are

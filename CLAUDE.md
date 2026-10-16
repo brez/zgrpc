@@ -162,7 +162,7 @@ at once, so a blocked `flush` cannot stall frame processing. A connection's
 header blocks are decoded only on its reader task — upstream's HPACK scratch
 buffer is `threadlocal` (not process-wide, as previously recorded here), so
 concurrency across connections is safe and interleaving within one is not.
-Measured cost: about 11us of p50 per call for the thread handoff, against a
+Measured cost: about 8us of p50 per call for the thread handoff, against a
 ~5ms budget. Full numbers and the two bugs it flushed out in docs/notes.md.
 
 **Flow-control windows**: 256KB per stream, 1MB per connection (raised by a
@@ -175,7 +175,7 @@ peer can make one connection buffer.
 a connection is opened only when every existing one is busy, so a sequential
 caller holds exactly one however high the ceiling. Idle first, then grow, then
 share the least loaded. Retired connections finish their calls before closing;
-no retries. Worth ~30% throughput and ~30% off p50 at 8 and 64 concurrent
+no retries. Worth 25-37% throughput and 27-42% off p50 at 8 and 64 concurrent
 callers on loopback (`zig build bench`, "under load"; numbers in docs/notes.md), which is where the
 default came from — re-measure on the target host, since the useful ceiling
 tracks cores.
@@ -209,6 +209,6 @@ nothing about building *against* it — a consumer gets only what `paths` lists
 and runs build.zig as a dependency, not as root. Dev-only build steps sit
 behind `if (b.pkg_hash.len != 0) return;` for the same reason. CI runs it.
 
-Still open: the milestone-2 in-VPC benchmark numbers, and a clean loopback
-re-measurement — every number recorded since the concurrency work was taken on
-a loaded machine, so only ratios are trustworthy.
+Still open: the milestone-2 in-VPC benchmark numbers. The loopback numbers in
+docs/notes.md were re-measured on a quiet machine (three runs; p50 is stable,
+p99/p999 are not).
