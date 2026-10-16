@@ -212,3 +212,9 @@ behind `if (b.pkg_hash.len != 0) return;` for the same reason. CI runs it.
 Still open: the milestone-2 in-VPC benchmark numbers. The loopback numbers in
 docs/notes.md were re-measured on a quiet machine (three runs; p50 is stable,
 p99/p999 are not).
+
+Next up:
+- Run `vpc/run.sh` between two machines on wired Ethernet, as a real-network
+  check ahead of the VPC run. Not the milestone-2 number.
+- Make `vpc/README.md` cloud-neutral (it says "security group", "AZ"); it was
+  written assuming AWS, and where the TSDB consumer runs is not yet recorded.
