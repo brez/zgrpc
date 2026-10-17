@@ -52,7 +52,44 @@ pub const CallOptions = struct {
     /// Distinct from a `.deadline_exceeded` status in a `Response`, which is
     /// the server reporting that *it* gave up.
     deadline_ns: ?u64 = null,
+
+    /// Custom request metadata, sent as HTTP/2 headers: trace ids, auth
+    /// tokens, anything the handler reads with `CallContext.metadata`.
+    ///
+    /// Borrowed for the duration of the call. Names are lowercase `[0-9a-z_.-]`
+    /// and values printable ASCII, and the headers the transport owns
+    /// (`content-type`, `te`, `user-agent`, anything `grpc-`) are refused with
+    /// `error.InvalidMetadata`, as are `-bin` names: those carry base64 on the
+    /// wire and encoding them is not implemented. At most `max_metadata_entries`.
+    metadata: []const h2.Header = &.{},
 };
+
+/// Bounds the header block a call can build on the stack.
+pub const max_metadata_entries = 16;
+
+/// Whether `entries` can go out as request metadata; see `CallOptions.metadata`.
+pub fn validateMetadata(entries: []const h2.Header) error{ InvalidMetadata, TooMuchMetadata }!void {
+    if (entries.len > max_metadata_entries) return error.TooMuchMetadata;
+    for (entries) |entry| {
+        if (entry.name.len == 0) return error.InvalidMetadata;
+        for (entry.name) |c| switch (c) {
+            'a'...'z', '0'...'9', '_', '.', '-' => {},
+            else => return error.InvalidMetadata,
+        };
+        // Names the transport sets, plus the connection-specific headers
+        // RFC 9113 8.2.2 forbids in HTTP/2 altogether.
+        const reserved = [_][]const u8{
+            "content-type",      "te",         "user-agent", "host",
+            "content-length",    "connection", "keep-alive", "proxy-connection",
+            "transfer-encoding", "upgrade",
+        };
+        for (reserved) |name| if (std.mem.eql(u8, entry.name, name)) return error.InvalidMetadata;
+        if (std.mem.startsWith(u8, entry.name, "grpc-")) return error.InvalidMetadata;
+        if (std.mem.endsWith(u8, entry.name, "-bin")) return error.InvalidMetadata;
+
+        for (entry.value) |c| if (c < 0x20 or c > 0x7e) return error.InvalidMetadata;
+    }
+}
 
 /// The result of a unary call.
 ///
@@ -313,6 +350,8 @@ pub const Client = struct {
         request: []const u8,
         call_options: CallOptions,
     ) !*h2.Stream {
+        try validateMetadata(call_options.metadata);
+
         var timeout_buf: [16]u8 = undefined;
         var timeout_text: ?[]const u8 = null;
         var deadline: ?std.Io.Clock.Timestamp = null;
@@ -328,7 +367,7 @@ pub const Client = struct {
             });
         }
 
-        var fields: [8]h2.Header = undefined;
+        var fields: [8 + max_metadata_entries]h2.Header = undefined;
         var n: usize = 0;
         // Pseudo-headers must come first and in this order.
         fields[n] = .{ .name = ":method", .value = "POST" };
@@ -347,6 +386,10 @@ pub const Client = struct {
         n += 1;
         if (timeout_text) |t| {
             fields[n] = .{ .name = "grpc-timeout", .value = t };
+            n += 1;
+        }
+        for (call_options.metadata) |entry| {
+            fields[n] = entry;
             n += 1;
         }
 
@@ -435,3 +478,47 @@ pub const Client = struct {
         };
     }
 };
+
+const testing = std.testing;
+
+test "ordinary metadata is accepted" {
+    try validateMetadata(&.{
+        .{ .name = "x-request-id", .value = "abc-123" },
+        .{ .name = "authorization", .value = "Bearer t0ken.with_symbols/+=" },
+        .{ .name = "trace.id_2", .value = "" },
+    });
+}
+
+test "metadata names must be lowercase header tokens" {
+    for ([_][]const u8{ "X-Request-Id", "has space", "colon:", "", "ünï" }) |name| {
+        try testing.expectError(error.InvalidMetadata, validateMetadata(&.{.{ .name = name, .value = "v" }}));
+    }
+}
+
+test "metadata cannot impersonate what the transport sets itself" {
+    for ([_][]const u8{
+        ":path",          ":authority", "content-type", "te",          "user-agent",    "host",
+        "content-length", "connection", "grpc-timeout", "grpc-status", "grpc-whatever",
+    }) |name| {
+        try testing.expectError(error.InvalidMetadata, validateMetadata(&.{.{ .name = name, .value = "v" }}));
+    }
+}
+
+test "binary metadata is refused rather than sent unencoded" {
+    // "-bin" values travel base64-encoded; sending raw bytes under such a name
+    // would be read by the peer as garbage. Not supported yet, so say so.
+    try testing.expectError(error.InvalidMetadata, validateMetadata(&.{.{ .name = "trace-bin", .value = "abc" }}));
+}
+
+test "metadata values are printable ASCII" {
+    for ([_][]const u8{ "line\nbreak", "tab\there", "nul\x00", "caf\xc3\xa9", "\x7f" }) |value| {
+        try testing.expectError(error.InvalidMetadata, validateMetadata(&.{.{ .name = "x-k", .value = value }}));
+    }
+}
+
+test "there is a bound on how much metadata one call carries" {
+    var many: [max_metadata_entries + 1]h2.Header = undefined;
+    for (&many) |*h| h.* = .{ .name = "x-k", .value = "v" };
+    try validateMetadata(many[0..max_metadata_entries]);
+    try testing.expectError(error.TooMuchMetadata, validateMetadata(&many));
+}

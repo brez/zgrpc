@@ -104,6 +104,17 @@ fn cancelProbeHandler(ctx: *zgrpc.CallContext, request: []const u8, stream: *zgr
     }
 }
 
+/// Answers with the metadata the client sent, so a test can see exactly what
+/// crossed the wire. Absent entries are reported as such, not as empty.
+fn metadataHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    return std.fmt.allocPrint(ctx.allocator, "id={s};auth={s}", .{
+        ctx.metadata("x-request-id") orelse "<none>",
+        ctx.metadata("authorization") orelse "<none>",
+    });
+}
+
+const metadata_path = "/zgrpc.test.Echo/Metadata";
 const rendezvous_path = "/zgrpc.test.Echo/Rendezvous";
 const cancel_probe_path = "/zgrpc.test.Echo/CancelProbe";
 
@@ -151,6 +162,7 @@ const stalled_path = "/zgrpc.test.Echo/Stalled";
 
 const methods = [_]zgrpc.Method{
     zgrpc.Method.unary(echo_path, echoHandler),
+    zgrpc.Method.unary(metadata_path, metadataHandler),
     zgrpc.Method.unary(deadline_report_path, deadlineReportHandler),
     zgrpc.Method.unary(slow_path, slowHandler),
     zgrpc.Method.serverStream(stalled_path, stalledStreamHandler),
@@ -1329,4 +1341,68 @@ test "shutdown with nothing in flight returns at once" {
     const took_ms = @divTrunc(started.durationFromNow(io).raw.nanoseconds * -1, std.time.ns_per_ms);
     try testing.expect(took_ms < 1000);
     try testing.expect(waitUnusable(fx.client, io, 1000));
+}
+
+// -- metadata ----------------------------------------------------------------
+
+test "metadata a client sends reaches the handler" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var response = try pair.client.call(metadata_path, "", .{ .metadata = &.{
+        .{ .name = "x-request-id", .value = "req-42" },
+        .{ .name = "authorization", .value = "Bearer abc" },
+    } });
+    defer response.deinit();
+    try testing.expectEqualStrings("id=req-42;auth=Bearer abc", response.message);
+}
+
+test "a call without metadata is unchanged" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    var response = try pair.client.call(metadata_path, "", .{});
+    defer response.deinit();
+    try testing.expectEqualStrings("id=<none>;auth=<none>", response.message);
+}
+
+test "invalid metadata fails the call before anything is sent" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    try testing.expectError(
+        error.InvalidMetadata,
+        pair.client.call(metadata_path, "", .{ .metadata = &.{.{ .name = "grpc-timeout", .value = "1n" }} }),
+    );
+    // And the connection is still good for the next, valid, call.
+    var response = try pair.client.call(echo_path, "after", .{});
+    defer response.deinit();
+    try testing.expectEqualStrings("after", response.message);
 }

@@ -21,6 +21,7 @@ pub const server = @import("server.zig");
 pub const pool = @import("pool.zig");
 
 pub const Keepalive = h2.Keepalive;
+pub const Header = h2.Header;
 pub const Code = status.Code;
 pub const Status = status.Status;
 pub const Client = client.Client;

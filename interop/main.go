@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -326,7 +327,25 @@ func main() {
 		return nil
 	}())
 
-	// 12. grpc-go picks its own units for `grpc-timeout` — it sends whatever
+	// 12. Custom metadata. grpc-go lowercases keys and sends them as ordinary
+	//    HPACK-compressed headers, with its own choice of indexing; what is
+	//    checked is that the handler sees them under the names a stub's caller
+	//    used.
+	check("request metadata from grpc-go reaches the handler", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ctx = metadata.AppendToOutgoingContext(ctx, "X-Request-Id", "req-7", "authorization", "Bearer abc")
+		resp, err := call(ctx, "/zgrpc.test.Echo/Metadata", nil)
+		if err != nil {
+			return err
+		}
+		if want := "id=req-7;auth=Bearer abc"; string(resp) != want {
+			return fmt.Errorf("handler saw %q, want %q", resp, want)
+		}
+		return nil
+	}())
+
+	// 13. grpc-go picks its own units for `grpc-timeout` — it sends whatever
 	//     of "n", "u", "m", "S"… fits the remaining time — so decoding what
 	//     *it* sends is a different check from decoding what we send.
 	check("grpc-timeout from grpc-go arrives as a usable deadline", func() error {
@@ -349,7 +368,7 @@ func main() {
 		return nil
 	}())
 
-	// 13. A call that outruns its deadline. The handler sleeps 300ms against a
+	// 14. A call that outruns its deadline. The handler sleeps 300ms against a
 	//     100ms deadline, so the status must be DeadlineExceeded and it must
 	//     arrive without waiting out the handler.
 	check("a call past its deadline fails with DEADLINE_EXCEEDED", func() error {

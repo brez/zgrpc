@@ -248,11 +248,15 @@ streams we opened past the GOAWAY's last id fail at once. Not checked against
 a grpc-go client; interop only covers grpc-go as the other side of unary and
 streaming calls.
 
+Request metadata is done, in one direction: `CallOptions.metadata` sends
+headers, `CallContext.metadata(name)` reads them, and grpc-go's arrive intact
+(interop check). Names are validated (lowercase, nothing the transport owns,
+no `grpc-` prefix, no `-bin`) and values must be printable ASCII. Deliberately
+not built: response headers and trailers set by a handler, readable by a
+client, and binary (`-bin`) metadata. harvezter's CLAUDE.md states no need for
+either — one trusted VPC, no auth — so they wait for a stated use.
+
 Found by reading the source (not exploited), in the order to do them:
-- Custom metadata: `CallOptions` carries only a deadline, so a client cannot
-  send auth or trace headers, and a handler cannot set response headers or
-  trailers beyond status. Check whether the TSDB needs this before it depends
-  on us.
 - Smaller: handler errors reach the caller as `@errorName(err)`; compression
   is unsupported (`CompressionNotSupported`); no metrics or logging hooks.
 - Not yet checked: rapid-reset behaviour under load, since stream handlers are

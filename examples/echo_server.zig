@@ -35,6 +35,17 @@ fn deadlineReport(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const
     return std.fmt.allocPrint(ctx.allocator, "{d}", .{@divTrunc(left.nanoseconds, std.time.ns_per_ms)});
 }
 
+/// Reports the request metadata the caller sent, so an interop client can check
+/// that headers a real gRPC stack puts on the wire arrive where a handler can
+/// read them.
+fn metadata(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    return std.fmt.allocPrint(ctx.allocator, "id={s};auth={s}", .{
+        ctx.metadata("x-request-id") orelse "<none>",
+        ctx.metadata("authorization") orelse "<none>",
+    });
+}
+
 /// Echoes after a fixed pause, so a caller can tell concurrent handling from
 /// sequential handling by the clock: N of these at once should take about as
 /// long as one, not N times as long.
@@ -56,6 +67,7 @@ const methods = [_]zgrpc.Method{
     zgrpc.Method.unary("/zgrpc.test.Echo/Call", echo),
     zgrpc.Method.unary("/zgrpc.test.Echo/Fail", fail),
     zgrpc.Method.unary("/zgrpc.test.Echo/Slow", slow),
+    zgrpc.Method.unary("/zgrpc.test.Echo/Metadata", metadata),
     zgrpc.Method.unary("/zgrpc.test.Echo/DeadlineReport", deadlineReport),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/Count", count),
     zgrpc.Method.serverStream("/zgrpc.test.Echo/CountThenFail", countThenFail),

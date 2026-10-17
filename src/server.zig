@@ -65,6 +65,16 @@ pub const CallContext = struct {
     /// specific code sets this and returns an empty body.
     status: Status = Status.ok,
 
+    /// A piece of request metadata the client sent, by name (any case), or
+    /// null. If the client sent the name more than once this is the first.
+    /// Pseudo-headers are not metadata and are never returned.
+    ///
+    /// The slice lives as long as the call.
+    pub fn metadata(self: *const CallContext, name: []const u8) ?[]const u8 {
+        if (name.len == 0 or name[0] == ':') return null;
+        return self.request_headers.get(name);
+    }
+
     pub fn fail(self: *CallContext, code: Code, message: []const u8) error{HandlerFailed} {
         self.status = .{ .code = code, .message = message };
         return error.HandlerFailed;
