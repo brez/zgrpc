@@ -219,12 +219,13 @@ Next up:
 - Make `vpc/README.md` cloud-neutral (it says "security group", "AZ"); it was
   written assuming AWS, and where the TSDB consumer runs is not yet recorded.
 
+Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused
+before their length sizes a buffer, a header block is capped at 64KB both
+compressed (CONTINUATION floods) and decoded (HPACK back-reference expansion),
+`SETTINGS_MAX_HEADER_LIST_SIZE` is advertised, and a stream carries at most two
+HEADERS frames. Each has a unit test in h2.zig that failed first.
+
 Found by reading the source (not exploited), in the order to do them:
-- Cap an accumulating header block: `readHeaderBlock` (h2.zig) follows
-  CONTINUATION frames without limit. Also reject frames over the advertised
-  `SETTINGS_MAX_FRAME_SIZE` (16384; `readFrame` accepts up to 16MB), advertise
-  and enforce `SETTINGS_MAX_HEADER_LIST_SIZE`, and bound HEADERS frames per
-  stream. Write the failing tests first.
 - Keepalive and idle timeout: nothing sends PING and there is no
   `SO_KEEPALIVE`, so a vanished client holds one of the 128 connection slots
   forever. `deadline_ns` defaulting to null means a call can wait forever on a

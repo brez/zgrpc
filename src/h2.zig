@@ -60,6 +60,20 @@ pub const client_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub const default_max_frame_size: u32 = 16_384;
 
+/// The most a decoded header list may weigh, counted as RFC 9113 6.5.2 counts
+/// it: name plus value plus 32 octets of overhead per field. Advertised in
+/// SETTINGS, and enforced on the way in both on the compressed block (so
+/// CONTINUATION frames cannot grow it without end) and on the decoded list (so
+/// HPACK back-references cannot expand a small block into a large one).
+///
+/// gRPC metadata is a handful of short fields; 64KB is far past any honest
+/// caller and small enough that a connection's worst case stays a rounding
+/// error next to its flow-control window.
+pub const max_header_list_size: u32 = 64 * 1024;
+
+/// HEADERS frames one stream may carry: the initial block, and trailers.
+const max_header_blocks_per_stream = 2;
+
 /// Fixed by RFC 9113 4.1.
 const frame_header_len = 9;
 
@@ -252,6 +266,10 @@ pub const Stream = struct {
     /// Bytes taken by the caller but not yet returned to the peer as
     /// flow-control credit.
     unacked: u32 = 0,
+
+    /// HEADERS frames received on this stream, bounded so a peer cannot queue
+    /// decoded blocks without limit.
+    header_blocks_received: u8 = 0,
 
     /// END_STREAM received.
     ended: bool = false,
@@ -755,6 +773,7 @@ pub const Connection = struct {
         const params = [_]struct { id: u16, value: u32 }{
             .{ .id = setting_enable_push, .value = 0 },
             .{ .id = setting_max_frame_size, .value = default_max_frame_size },
+            .{ .id = setting_max_header_list_size, .value = max_header_list_size },
             .{ .id = setting_initial_window_size, .value = @intCast(default_stream_window) },
             .{ .id = setting_max_concurrent_streams, .value = default_max_concurrent_streams },
         };
@@ -1034,6 +1053,9 @@ pub const Connection = struct {
         // next read blocks, which is the moment deferred wakeups are owed.
         if (self.reader.bufferedLen() < frame_header_len) self.flushWakes();
         const header = try FrameHeader.read(self.reader);
+        // Checked before the length sizes a buffer: it is the peer's number,
+        // and we told it the limit in SETTINGS (RFC 9113 4.2).
+        if (header.length > default_max_frame_size) return error.FrameSizeError;
 
         if (header.length > 0) {
             if (self.reader.bufferedLen() < header.length) self.flushWakes();
@@ -1190,6 +1212,8 @@ pub const Connection = struct {
             } orelse null;
 
             if (stream) |s| {
+                if (s.header_blocks_received >= max_header_blocks_per_stream) return error.ProtocolError;
+                s.header_blocks_received += 1;
                 try s.header_blocks.append(self.allocator, .{
                     .headers = headers,
                     .after_bytes = s.recv_total,
@@ -1270,6 +1294,9 @@ pub const Connection = struct {
             const header = try FrameHeader.read(self.reader);
             if (header.frame_type != .CONTINUATION) return error.ExpectedContinuation;
             if (header.stream_id != first.header.stream_id) return error.ProtocolError;
+            if (header.length > default_max_frame_size) return error.FrameSizeError;
+            // Before the read, so a flood is refused rather than consumed.
+            if (block.items.len + header.length > max_header_list_size) return error.HeaderListTooLarge;
 
             try self.payload_buf.resize(self.allocator, header.length);
             try self.reader.readSliceAll(self.payload_buf.items);
@@ -1292,6 +1319,7 @@ pub const Connection = struct {
         const arena = headers.arena.allocator();
 
         var offset: usize = 0;
+        var list_size: usize = 0;
         while (offset < block.len) {
             const decoded = try Hpack.decodeHeaderFieldView(block[offset..], &self.decode_table);
             if (decoded.bytes_consumed == 0) return error.InvalidEncoding;
@@ -1299,6 +1327,9 @@ pub const Connection = struct {
 
             // A dynamic-table size update carries no field.
             if (decoded.header.name.len == 0) continue;
+
+            list_size += decoded.header.name.len + decoded.header.value.len + 32;
+            if (list_size > max_header_list_size) return error.HeaderListTooLarge;
 
             try headers.list.append(arena, .{
                 .name = try arena.dupe(u8, decoded.header.name),
@@ -1374,4 +1405,96 @@ test "unpadded frames are returned untouched" {
         .payload = &payload,
     };
     try testing.expectEqualStrings("hi", dataPayload(frame));
+}
+
+// -- inbound size limits -----------------------------------------------------
+
+fn testFrameHeader(buf: []u8, length: u24, frame_type: FrameType, flags: u8, stream_id: u32) void {
+    std.mem.writeInt(u24, buf[0..3], length, .big);
+    buf[3] = @intFromEnum(frame_type);
+    buf[4] = flags;
+    std.mem.writeInt(u32, buf[5..9], stream_id, .big);
+}
+
+test "a frame longer than the advertised max frame size is rejected unread" {
+    // Only the header is present. A reader that trusted the length would size
+    // a buffer from it before discovering there is nothing to fill it with.
+    var bytes: [9]u8 = undefined;
+    testFrameHeader(&bytes, default_max_frame_size + 1, .DATA, 0, 1);
+    var r = std.Io.Reader.fixed(&bytes);
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    try testing.expectError(error.FrameSizeError, conn.readFrame());
+    try testing.expectEqual(@as(usize, 0), conn.payload_buf.capacity);
+}
+
+test "CONTINUATION frames cannot grow a header block without limit" {
+    const frames = 64; // 64 * 16KB, well past any sane header block
+    const chunk = default_max_frame_size;
+    const bytes = try testing.allocator.alloc(u8, 9 + (frames + 1) * (9 + chunk));
+    defer testing.allocator.free(bytes);
+    @memset(bytes, 0);
+
+    // HEADERS without END_HEADERS, then CONTINUATION after CONTINUATION.
+    testFrameHeader(bytes[0..9], 0, .HEADERS, 0, 1);
+    var at: usize = 9;
+    for (0..frames) |_| {
+        testFrameHeader(bytes[at..][0..9], chunk, .CONTINUATION, 0, 1);
+        at += 9 + chunk;
+    }
+
+    var r = std.Io.Reader.fixed(bytes[0..at]);
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    try testing.expectError(error.HeaderListTooLarge, conn.readFrame());
+    // It must have stopped reading, not merely failed at the end.
+    try testing.expect(r.seek < at / 2);
+}
+
+test "a small header block cannot expand past the header list limit" {
+    // One 4000-byte literal that goes into the dynamic table, then single-byte
+    // references to it. The compressed block is tiny; the decoded list is not.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(testing.allocator);
+    try block.appendSlice(testing.allocator, &.{ 0x40, 0x01, 'x', 0x7f, 0xa1, 0x1e }); // 4000 = 127 + 3873; 3873 = 30*128 + 33
+    try block.appendNTimes(testing.allocator, 'v', 4000);
+    try block.appendNTimes(testing.allocator, 0xbe, 20); // index 62, 20 times
+
+    const bytes = try testing.allocator.alloc(u8, 9 + block.items.len);
+    defer testing.allocator.free(bytes);
+    testFrameHeader(bytes[0..9], @intCast(block.items.len), .HEADERS, FrameFlags.END_HEADERS, 1);
+    @memcpy(bytes[9..], block.items);
+
+    var r = std.Io.Reader.fixed(bytes);
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    try testing.expectError(error.HeaderListTooLarge, conn.readFrame());
+}
+
+test "a stream cannot carry more than a header block and its trailers" {
+    // Block 0x82 is ":method: GET", valid and tiny.
+    var bytes: [3 * 10]u8 = undefined;
+    for (0..3) |i| {
+        testFrameHeader(bytes[i * 10 ..][0..9], 1, .HEADERS, FrameFlags.END_HEADERS, 1);
+        bytes[i * 10 + 9] = 0x82;
+    }
+    var r = std.Io.Reader.fixed(&bytes);
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    try conn.readFrame();
+    try conn.readFrame();
+    try testing.expectError(error.ProtocolError, conn.readFrame());
 }
