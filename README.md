@@ -11,7 +11,7 @@ connection pool, and enforced deadlines. Zig 0.16.0.
 ## Installing
 
 ```
-zig fetch --save "git+https://github.com/brez/zgrpc#v0.1.0"
+zig fetch --save "git+https://github.com/brez/zgrpc#v0.2.0"
 ```
 
 ```zig
@@ -151,10 +151,32 @@ only ... does not include a gRPC transport layer") and its handler signatures
 are not zgrpc's, so it is not something to plug in. Closing this properly means
 a protoc plugin that emits zgrpc handlers, which does not exist yet.
 
+## Operating a server
+
+- **Shutdown.** Cancel the task running `serve`, call `server.shutdown(grace_ns)`,
+  then `deinit`. Clients get GOAWAY and calls in flight finish within the grace
+  period; `shutdown` returns false if some outlast it, and `deinit` cuts those.
+- **Keepalive.** Both ends PING a peer that has been silent and drop it if
+  nothing at all arrives in time, so a vanished client frees its connection
+  slot. Server default 30s/10s; client default 6min/20s, because grpc-go servers
+  answer pings under 5 minutes apart with GOAWAY. `Options.keepalive = null`
+  turns it off.
+- **Reset limit.** `Server.Options.reset_limit` (default 2,000/s, burst 4,000)
+  disconnects a peer that cancels streams faster than that, which is the
+  rapid-reset attack. `null` turns it off.
+- **Metadata.** `CallOptions.metadata` sends request headers, validated before
+  anything goes out; handlers read them with `ctx.metadata("name")`.
+- **Limits on what a peer can send.** Frames, header blocks and header lists
+  are bounded (64KB for a header block), and a stream carries at most two
+  HEADERS frames.
+
 ## What it does not do
 
 - **No TLS.** h2c only, and no ALPN, so it cannot talk to a TLS endpoint.
-- **No compression.** The compressed-message flag is parsed and rejected.
+- **No compression.** A request in any encoding but identity gets UNIMPLEMENTED,
+  and a compressed response is an error on the client.
+- **No response metadata, no binary metadata.** A handler cannot set response
+  headers or trailers beyond the status, and `-bin` names are refused.
 - **No retries, load balancing, interceptors or name resolution.** A pool is
   several connections to *one* peer.
 - **No generated service stubs.** Message types come from protoc; method paths
@@ -189,7 +211,7 @@ the size they are, and the bugs interop and benchmarking found.
 
 ## Versioning
 
-**v0.1.0**, semantic, with 0.x meaning the Zig API may still move — with one
+**v0.2.0**, semantic, with 0.x meaning the Zig API may still move — with one
 consumer, an awkward API is worth breaking rather than living with. The wire
 behaviour is the stable part, and the interop suite is what a bump has to keep
 passing.
