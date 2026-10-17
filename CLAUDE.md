@@ -268,13 +268,18 @@ INTERNAL message, which is useful in a trusted VPC and worth revisiting before
 anything leaves it. Metrics and logging hooks are not built: they are
 interceptor-shaped, which the scope rules exclude, and no consumer has asked.
 
-Rapid reset is measured and half fixed (numbers in docs/notes.md, tool is
+Rapid reset is measured and handled (numbers in docs/notes.md, tool is
 `zig build flood`). Live streams were already bounded at 128 because a reset
 stream keeps its slot until its call task ends. The cost was a task, i.e. a
 thread, per accepted stream: 139 threads and 46MB under a single attacker, now
 10 and 12.6MB, because `acceptStream` drops streams reset while they waited.
-What remains is raw CPU: four attackers at ~500k resets/s still push a
-bystander's p99 from 0.3ms to 7ms on this 4-core machine. Fixing that takes a
-per-connection reset-rate limit answered with GOAWAY(ENHANCE_YOUR_CALM). Not
-built, because the threshold is a policy that can also cut off an honest pool
-whose callers time out in bulk during an outage; decide it deliberately.
+What remained was raw CPU, so `Server.Options.reset_limit` bounds the rate:
+token bucket per connection, default 2,000/s with a burst of 4,000, over which a
+peer gets GOAWAY(ENHANCE_YOUR_CALM) and is disconnected. Four attackers that
+took a bystander's p99 from 0.3ms to 7ms are now all cut off within the burst
+and the bystander sees 0.35ms. The risk is an honest pool timing out in bulk
+during an outage; the defaults are far above ordinary traffic and `null` turns
+it off. The client has no such limit — nothing a server does is worth one yet.
+
+Every item the source-reading pass found is now done. What is left is the
+milestone-2 in-VPC numbers and the two "Next up" items above.

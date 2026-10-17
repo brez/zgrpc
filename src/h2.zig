@@ -91,6 +91,24 @@ pub const Keepalive = struct {
     timeout_ns: u64,
 };
 
+/// A ceiling on how fast a peer may cancel streams.
+///
+/// Cancelling is the cheapest thing a peer can do that makes us do work: it
+/// opens a stream, which we decode and start a call for, and resets it, which
+/// frees its own slot at once. Done in a loop that is the rapid-reset attack,
+/// and no bound on concurrent streams slows it, because the peer is not
+/// waiting for anything. So the rate itself is limited: a token bucket,
+/// `burst` resets available at once and `per_second` more each second. A peer
+/// that runs it dry is sent GOAWAY(ENHANCE_YOUR_CALM) and disconnected.
+///
+/// The risk is cutting off an honest peer whose callers time out in bulk, so
+/// the defaults sit far above anything ordinary traffic does; a pool abandoning
+/// calls by the hundred is well inside them.
+pub const ResetLimit = struct {
+    per_second: u32,
+    burst: u32,
+};
+
 /// Opaque payload of the PING that ends the first phase of a drain. Distinct
 /// from the keepalive PING's zeros, so neither mistakes the other's ack.
 const drain_ping = "zgrpcdrn".*;
@@ -161,6 +179,7 @@ pub const error_code_stream_closed: u32 = 0x5;
 pub const error_code_frame_size_error: u32 = 0x6;
 pub const error_code_refused_stream: u32 = 0x7;
 pub const error_code_cancel: u32 = 0x8;
+pub const error_code_enhance_your_calm: u32 = 0xb;
 
 /// A condition variable whose waits can be bounded by a deadline.
 ///
@@ -549,6 +568,13 @@ pub const Connection = struct {
     wake_flow: bool = false,
 
     reader_task: ?std.Io.Future(void) = null,
+
+    /// Set before `start`. Null leaves resets unlimited.
+    reset_limit: ?ResetLimit = null,
+    /// The bucket behind `reset_limit`. Reader task only.
+    reset_tokens: f64 = 0,
+    reset_checked_ns: i96 = 0,
+    reset_primed: bool = false,
 
     /// Set before `start`. Null disables keepalive.
     keepalive: ?Keepalive = null,
@@ -1237,7 +1263,10 @@ pub const Connection = struct {
             },
             .WINDOW_UPDATE => try self.applyWindowUpdate(frame),
             .GOAWAY => try self.applyGoAway(frame),
-            .RST_STREAM => try self.applyRstStream(frame),
+            .RST_STREAM => {
+                try self.chargeReset();
+                try self.applyRstStream(frame);
+            },
             .HEADERS => try self.applyHeaders(frame),
             .DATA => try self.applyData(frame),
             // PRIORITY and anything unknown: ignored, per RFC 9113 4.1.
@@ -1327,6 +1356,32 @@ pub const Connection = struct {
         }
         self.wake_flow = true;
         self.wake_accept = true;
+    }
+
+    /// Spends one token of the reset allowance, or ends the connection. Counts
+    /// every RST_STREAM, including those for streams that no longer exist: a
+    /// flood does not stop being one because its targets are already gone.
+    fn chargeReset(self: *Connection) !void {
+        const limit = self.reset_limit orelse return;
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const burst: f64 = @floatFromInt(limit.burst);
+
+        if (!self.reset_primed) {
+            self.reset_tokens = burst;
+            self.reset_primed = true;
+        } else {
+            const elapsed_s = @as(f64, @floatFromInt(now - self.reset_checked_ns)) / std.time.ns_per_s;
+            self.reset_tokens = @min(burst, self.reset_tokens + elapsed_s * @as(f64, @floatFromInt(limit.per_second)));
+        }
+        self.reset_checked_ns = now;
+
+        if (self.reset_tokens < 1) {
+            // Best effort: the peer is misbehaving and may not be reading.
+            self.sendGoAway(self.last_peer_stream_id, error_code_enhance_your_calm) catch {};
+            self.flush() catch {};
+            return error.TooManyResets;
+        }
+        self.reset_tokens -= 1;
     }
 
     fn applyRstStream(self: *Connection, frame: Frame) !void {
@@ -1748,4 +1803,71 @@ test "a stream reset before it is accepted is dropped, not handed out" {
     // And the dropped one is gone from the table, or it would hold a
     // concurrent-stream slot for good.
     try testing.expect(conn.streams.get(1) == null);
+}
+
+// -- reset rate limit --------------------------------------------------------
+
+/// `n` RST_STREAM frames for streams that do not exist, back to back.
+fn resetFlood(buf: []u8, n: usize) []u8 {
+    for (0..n) |i| {
+        const at = buf[i * 13 ..][0..13];
+        testFrameHeader(at[0..9], 4, .RST_STREAM, 0, @intCast(2 * i + 1));
+        std.mem.writeInt(u32, at[9..13], error_code_cancel, .big);
+    }
+    return buf[0 .. n * 13];
+}
+
+test "resets past the burst end the connection with ENHANCE_YOUR_CALM" {
+    var bytes: [13 * 16]u8 = undefined;
+    var r = std.Io.Reader.fixed(resetFlood(&bytes, 6));
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+    conn.reset_limit = .{ .per_second = 1, .burst = 5 };
+
+    for (0..5) |_| try conn.readFrame();
+    try testing.expectError(error.TooManyResets, conn.readFrame());
+
+    // The peer is told why, in the one frame that can say so, before the
+    // connection goes: a client that sees only a closed socket cannot tell a
+    // limit from a crash.
+    const written = w.buffered();
+    try testing.expect(written.len >= 17);
+    try testing.expectEqual(@intFromEnum(FrameType.GOAWAY), written[3]);
+    try testing.expectEqual(error_code_enhance_your_calm, std.mem.readInt(u32, written[13..17], .big));
+}
+
+test "no limit means resets are never refused" {
+    var bytes: [13 * 16]u8 = undefined;
+    var r = std.Io.Reader.fixed(resetFlood(&bytes, 16));
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    for (0..16) |_| try conn.readFrame();
+}
+
+test "the allowance refills over time" {
+    var bytes: [13 * 16]u8 = undefined;
+    var r = std.Io.Reader.fixed(resetFlood(&bytes, 7));
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+    // Two to spend, and two back every 20ms.
+    conn.reset_limit = .{ .per_second = 100, .burst = 2 };
+
+    try conn.readFrame();
+    try conn.readFrame();
+    try std.Io.sleep(testing.io, .fromMilliseconds(60), .awake);
+    try conn.readFrame();
+    try conn.readFrame();
+    // The refill is capped at the burst, not saved up without end: after this
+    // wait an uncapped bucket would hold ten, and the third read would pass.
+    try std.Io.sleep(testing.io, .fromMilliseconds(100), .awake);
+    try conn.readFrame();
+    try conn.readFrame();
+    try testing.expectError(error.TooManyResets, conn.readFrame());
 }

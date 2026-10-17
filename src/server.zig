@@ -213,6 +213,10 @@ pub const Options = struct {
     /// `2 * io_buffer_bytes`, and accepting without a bound lets a peer decide
     /// how much of both to spend.
     max_concurrent_connections: usize = 128,
+    /// Disconnects a peer that cancels streams faster than this. Null allows
+    /// any rate, and a peer can then make the server start a call per stream
+    /// as fast as it can write; see `h2.ResetLimit`.
+    reset_limit: ?h2.ResetLimit = .{ .per_second = 2_000, .burst = 4_000 },
     /// Drops a peer that stops answering, which is what frees the slot of a
     /// client that vanished. Null disables it, and a vanished client then holds
     /// its slot until the kernel gives up on the socket, which is hours.
@@ -364,6 +368,7 @@ pub const Server = struct {
             error.ConnectionResetByPeer,
             error.Canceled,
             => {},
+            error.TooManyResets => log.warn("dropped a peer that was cancelling streams too fast", .{}),
             error.KeepaliveTimeout => log.info("dropped a peer that stopped answering", .{}),
             else => log.warn("connection failed: {t}", .{err}),
         };
@@ -407,6 +412,7 @@ pub const Server = struct {
         defer conn.deinit();
 
         conn.keepalive = self.options.keepalive;
+        conn.reset_limit = self.options.reset_limit;
 
         // The preface is read on this task, before the reader starts: it is
         // not a frame, and letting the frame loop try to parse it would turn a

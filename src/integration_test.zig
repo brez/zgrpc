@@ -1505,3 +1505,86 @@ test "a compressed message with no encoding named is a protocol error" {
     // with the bytes.
     try testing.expectEqual(@as(u32, 13), try rawCallStatus(pair.client, pair.authority, null, 1));
 }
+
+// -- reset rate limit --------------------------------------------------------
+
+test "a peer that resets streams in a flood is cut off, and others are unaffected" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(server);
+    server.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &methods,
+        .{ .reset_limit = .{ .per_second = 100, .burst = 100 } },
+    );
+    defer server.deinit();
+    const bound = server.boundAddress();
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    var serving = try io.concurrent(serveTask, .{server});
+    defer _ = serving.cancel(io);
+
+    const bystander = try zgrpc.Client.connect(allocator, io, bound, authority, .{});
+    defer bystander.deinit();
+    const attacker = try zgrpc.Client.connect(allocator, io, bound, authority, .{});
+    defer attacker.deinit();
+
+    const fields = [_]zgrpc.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = echo_path },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "application/grpc+proto" },
+        .{ .name = "te", .value = "trailers" },
+    };
+
+    // Open and cancel as fast as possible. The server's allowance is 100 plus
+    // 100 a second, so it must give up long before this loop would.
+    var opened: usize = 0;
+    const limit = 50_000;
+    while (opened < limit and attacker.isUsable()) : (opened += 1) {
+        const stream = attacker.conn.openStream(&fields, true, null) catch break;
+        stream.ended = false; // so closing it sends RST_STREAM rather than nothing
+        attacker.conn.closeStream(stream);
+    }
+    try testing.expect(opened < limit);
+    try testing.expect(!attacker.isUsable());
+
+    // Nobody else on the server noticed.
+    var response = try bystander.call(echo_path, "unaffected", .{});
+    defer response.deinit();
+    try testing.expectEqualStrings("unaffected", response.message);
+}
+
+test "ordinary cancellation stays well inside the default limit" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    // A caller abandoning a hundred streaming calls is a bad day, not an
+    // attack, and must not cost it its connection.
+    for (0..100) |_| {
+        var stream = try pair.client.callServerStream(count_path, "1000", .{});
+        _ = try stream.next();
+        stream.deinit();
+    }
+    var response = try pair.client.call(echo_path, "still here", .{});
+    defer response.deinit();
+    try testing.expectEqualStrings("still here", response.message);
+}

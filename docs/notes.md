@@ -279,7 +279,19 @@ read. After, one attacker, ~190k resets/s: p99 0.70 ms, 68,250 legit calls,
 attackers, ~511k resets/s: threads 19, RSS 13 MB, but p99 is still 7.2 ms and
 legit calls 9,455. That is CPU saturation, five busy reader tasks on four
 cores, not a resource leak, and only a limit on the reset rate would address
-it. That limit is a policy (see CLAUDE.md) and is not built.
+it.
+
+That limit is `Server.Options.reset_limit`: a token bucket per connection,
+default 2,000 resets/s with a burst of 4,000, counting every RST_STREAM
+including those for streams already gone. A peer that runs it dry gets
+GOAWAY(ENHANCE_YOUR_CALM) naming its last stream, then the connection is
+closed. Same four attackers, same machine: all four disconnected within the
+burst (about 50,000 streams between them, against 2.5 million before), the
+bystander's p99 347 us against 273 us idle, 95,626 calls against 9,455. The
+default is far above ordinary traffic; the test for that has a caller abandon a
+hundred streaming calls in a row. A pool whose callers all time out at once
+during an outage is the case that could trip it, which is why it is an option
+and `null` turns it off.
 
 Not done: a call whose HEADERS were accepted and whose RST arrives afterwards
 still runs its handler to the first read or write that notices. A stream
