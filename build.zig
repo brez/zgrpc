@@ -75,6 +75,21 @@ pub fn build(b: *std.Build) void {
     // The milestone-2 pair: run `vpc_server` on one host and `vpc_bench` on
     // another. Cross-compile with -Dtarget= and copy the binaries over.
     const vpc_step = b.step("vpc", "Build the in-VPC benchmark binaries (vpc_server, vpc_bench)");
+    // Rapid-reset load; see the header of examples/reset_flood.zig.
+    const flood_step = b.step("flood", "Build reset_flood, the rapid-reset load tool");
+    {
+        const exe = b.addExecutable(.{
+            .name = "reset_flood",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/reset_flood.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{.{ .name = "zgrpc", .module = mod }},
+            }),
+        });
+        flood_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     for ([_][]const u8{ "vpc_server", "vpc_bench" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,

@@ -241,6 +241,51 @@ Deadlines are measured on a clock unaffected by system time changes, so a call
 given five seconds does not become a call given an hour because NTP stepped
 backwards.
 
+## Rapid reset
+
+CVE-2023-44487: open a stream and reset it at once. The client's own stream
+slot is free the moment it resets, so it can do this as fast as it can write;
+the server has to decode the headers and start a call for each. `zig build
+flood` builds `reset_flood`, which mounts the attack with the client's own API
+(`openStream` then `closeStream`) against `vpc_server`, while a second
+connection makes sequential 64-byte calls. `--mode calls` is the control: the
+same number of generators making ordinary calls. Server threads and RSS were
+sampled from /proc/<pid>. A 4-core Raspberry Pi with everything on it, so
+read the shapes, not the absolute figures.
+
+What bounds it already: a stream stays in the table, counted against the 128
+concurrent-stream limit, until its call task has finished, however early the
+peer reset it. Resetting does not buy the attacker a fresh slot, which is the
+whole of the original vulnerability in servers that freed it. So concurrent work
+was never unbounded.
+
+What it cost anyway. Before: every accepted stream got a task, which under
+`std.Io.Threaded` is a thread, so a flood ran the server up to its cap in live
+threads.
+
+| load on the server                      | legit p99 | legit calls / 5s | server threads | RSS   |
+|-----------------------------------------|----------:|-----------------:|---------------:|------:|
+| none                                    |   0.3 ms  |         ~100,000 |              - |     - |
+| 4 ordinary-call generators (control)    |   0.7 ms  |           48,205 |             23 | 12 MB |
+| 1 reset attacker, ~157k resets/s        |   1.55 ms |           33,539 |            139 | 46 MB |
+| 4 reset attackers, ~468k resets/s       |   7.3 ms  |            9,711 |             87 | 32 MB |
+
+The control is the point: resets cost something ordinary load does not.
+
+The fix is small. `acceptStream` now drops a stream that was reset while it
+waited instead of handing it out, so no task is started to find out on its first
+read. After, one attacker, ~190k resets/s: p99 0.70 ms, 68,250 legit calls,
+10 threads, 12.6 MB, indistinguishable from the control on resources. Four
+attackers, ~511k resets/s: threads 19, RSS 13 MB, but p99 is still 7.2 ms and
+legit calls 9,455. That is CPU saturation, five busy reader tasks on four
+cores, not a resource leak, and only a limit on the reset rate would address
+it. That limit is a policy (see CLAUDE.md) and is not built.
+
+Not done: a call whose HEADERS were accepted and whose RST arrives afterwards
+still runs its handler to the first read or write that notices. A stream
+handler does that promptly; a unary handler that is purely CPU does not,
+because nothing preempts it.
+
 ## Interop findings
 
 Bugs found this way that the internal tests missed:
@@ -279,6 +324,7 @@ src/tcp.zig              TCP_NODELAY
 src/integration_test.zig end-to-end tests over loopback
 examples/echo_server.zig standalone server (interop target)
 examples/bench.zig       loopback latency and pool throughput
+examples/reset_flood.zig rapid-reset load tool (zig build flood)
 examples/vpc_*.zig      two-host benchmark for milestone 2 (see vpc/)
 interop/                 grpc-go interop suite
 packaging/               proof that it works as a published dependency

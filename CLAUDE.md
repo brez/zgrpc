@@ -127,6 +127,8 @@ consumer to validate the abstractions against:
 - `zig build bench` — loopback latency baseline (NOT the milestone-2 number),
   plus pool throughput under load
 - `zig build bench-build` / `zig build test-integration-build` — compile only
+- `zig build flood` — build `reset_flood`, the rapid-reset load tool (run it
+  against `vpc_server`; see docs/notes.md)
 - `./interop/run.sh` — grpc-go interop suite; requires Go
 - `./packaging/verify.sh` — fetch and use zgrpc as a published dependency
 - `cd examples/protobuf && zig build run` — protobuf end to end; a standalone
@@ -266,6 +268,13 @@ INTERNAL message, which is useful in a trusted VPC and worth revisiting before
 anything leaves it. Metrics and logging hooks are not built: they are
 interceptor-shaped, which the scope rules exclude, and no consumer has asked.
 
-Found by reading the source (not exploited), in the order to do them:
-- Not yet checked: rapid-reset behaviour under load, since stream handlers are
-  launched before a RST_STREAM can cancel them.
+Rapid reset is measured and half fixed (numbers in docs/notes.md, tool is
+`zig build flood`). Live streams were already bounded at 128 because a reset
+stream keeps its slot until its call task ends. The cost was a task, i.e. a
+thread, per accepted stream: 139 threads and 46MB under a single attacker, now
+10 and 12.6MB, because `acceptStream` drops streams reset while they waited.
+What remains is raw CPU: four attackers at ~500k resets/s still push a
+bystander's p99 from 0.3ms to 7ms on this 4-core machine. Fixing that takes a
+per-connection reset-rate limit answered with GOAWAY(ENHANCE_YOUR_CALM). Not
+built, because the threshold is a policy that can also cut off an honest pool
+whose callers time out in bulk during an outage; decide it deliberately.

@@ -724,7 +724,18 @@ pub const Connection = struct {
         defer self.mutex.unlock(io);
 
         while (true) {
-            if (self.incoming.items.len > 0) return self.incoming.orderedRemove(0);
+            if (self.incoming.items.len > 0) {
+                const stream = self.incoming.orderedRemove(0);
+                // Reset while it waited: nobody is left to answer, and a task
+                // started for it would learn that only on its first read. Under
+                // a flood of open-then-reset streams that is a task, which on
+                // some `Io` implementations is a thread, per stream for nothing.
+                if (stream.reset) {
+                    self.forgetLocked(stream.id);
+                    continue;
+                }
+                return stream;
+            }
             if (self.closed) {
                 if (self.read_error) |err| return err;
                 return null;
@@ -757,7 +768,12 @@ pub const Connection = struct {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.forgetLocked(id);
+    }
 
+    /// Caller must hold `mutex`.
+    fn forgetLocked(self: *Connection, id: u32) void {
+        const io = self.io;
         const entry = self.streams.fetchRemove(id) orelse return;
 
         // Bytes buffered for a stream nobody will read still cost connection
@@ -1705,4 +1721,31 @@ test "a reader keeps answering after GOAWAY" {
     try testing.expect(written.len >= 17);
     try testing.expectEqual(@intFromEnum(FrameType.PING), written[3]);
     try testing.expectEqual(@as(u8, FrameFlags.ACK), written[4]);
+}
+
+test "a stream reset before it is accepted is dropped, not handed out" {
+    // A flood of open-then-reset streams would otherwise cost the server a
+    // task apiece, to discover on its first read that the caller had gone.
+    var r = std.Io.Reader.fixed("");
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, true);
+    defer conn.deinit();
+
+    // Stream 1 was reset while it waited; stream 3 was not.
+    for ([_]u32{ 1, 3 }) |id| {
+        const stream = try testing.allocator.create(Stream);
+        stream.* = .{ .conn = &conn, .id = id, .send_window = protocol_initial_window };
+        stream.reset = id == 1;
+        try conn.streams.put(testing.allocator, id, stream);
+        try conn.incoming.append(testing.allocator, stream);
+    }
+    conn.closed = true; // so an empty queue ends the loop instead of waiting
+
+    const accepted = (try conn.acceptStream()).?;
+    try testing.expectEqual(@as(u32, 3), accepted.id);
+    try testing.expect((try conn.acceptStream()) == null);
+    // And the dropped one is gone from the table, or it would hold a
+    // concurrent-stream slot for good.
+    try testing.expect(conn.streams.get(1) == null);
 }
