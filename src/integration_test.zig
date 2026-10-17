@@ -1070,3 +1070,131 @@ test "a pooled server-streaming call holds its connection until deinit" {
     try testing.expectEqualStrings("after", after.message);
     try testing.expectEqual(@as(usize, 2), pool.connectionCount());
 }
+
+// -- keepalive ---------------------------------------------------------------
+
+const fast_keepalive: zgrpc.Keepalive = .{
+    .interval_ns = 50 * std.time.ns_per_ms,
+    .timeout_ns = 50 * std.time.ns_per_ms,
+};
+
+/// Connection slots the server has handed out. Racy by nature, so the tests
+/// poll it rather than read it once.
+fn slotsInUse(server: *zgrpc.Server, total: usize) usize {
+    const io = server.io;
+    server.slots.mutex.lockUncancelable(io);
+    defer server.slots.mutex.unlock(io);
+    return total - server.slots.permits;
+}
+
+/// Polls `slotsInUse` until it equals `want`, for at most `limit_ms`.
+fn waitForSlots(server: *zgrpc.Server, total: usize, want: usize, limit_ms: usize) bool {
+    var waited: usize = 0;
+    while (waited < limit_ms) : (waited += 5) {
+        if (slotsInUse(server, total) == want) return true;
+        std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch return false;
+    }
+    return slotsInUse(server, total) == want;
+}
+
+test "a peer that goes silent is dropped, freeing its connection slot" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const slots = 4;
+    const server = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(server);
+    server.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &methods,
+        .{ .max_concurrent_connections = slots, .keepalive = fast_keepalive },
+    );
+    defer server.deinit();
+
+    var serving = try io.concurrent(serveTask, .{server});
+    defer _ = serving.cancel(io);
+
+    // A raw peer: does the handshake, then never reads and never answers. To
+    // the server it is indistinguishable from a machine that fell off the
+    // network.
+    var addr = server.boundAddress();
+    const sock = try addr.connect(io, .{ .mode = .stream });
+    defer sock.close(io);
+    var wbuf: [256]u8 = undefined;
+    var writer = sock.writer(io, &wbuf);
+    try writer.interface.writeAll(zgrpc.h2.client_preface);
+    try writer.interface.writeAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 }); // empty SETTINGS
+    try writer.interface.flush();
+
+    // `serve` holds one slot for the accept it is waiting on, so an idle
+    // server reads 1 and one connected peer reads 2.
+    try testing.expect(waitForSlots(server, slots, 2, 2000));
+    // Without keepalive this never happens: the slot is held for good.
+    try testing.expect(waitForSlots(server, slots, 1, 3000));
+}
+
+test "a peer that answers pings keeps its connection while idle" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(server);
+    server.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &methods,
+        .{ .keepalive = fast_keepalive },
+    );
+    defer server.deinit();
+    const bound = server.boundAddress();
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    var serving = try io.concurrent(serveTask, .{server});
+    defer _ = serving.cancel(io);
+
+    const client = try zgrpc.Client.connect(allocator, io, bound, authority, .{});
+    defer client.deinit();
+
+    // Idle for many keepalive periods: enough pings that a server which
+    // mistook "no calls" for "no peer" would have hung up several times.
+    try std.Io.sleep(io, .fromMilliseconds(600), .awake);
+
+    var response = try client.call(echo_path, "still here", .{});
+    defer response.deinit();
+    try testing.expectEqualStrings("still here", response.message);
+}
+
+test "a client gives up on a server that stops answering" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Listening but never accepting or reading: the kernel completes the
+    // handshake, so the client connects and then hears nothing, ever.
+    var addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var dead = try addr.listen(io, .{ .reuse_address = true });
+    defer dead.deinit(io);
+    const bound = dead.socket.address;
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    const client = try zgrpc.Client.connect(allocator, io, bound, authority, .{ .keepalive = fast_keepalive });
+    defer client.deinit();
+
+    // The deadline is only a backstop so a regression fails instead of
+    // hanging; what is asserted is that keepalive got there first.
+    const result = client.call(echo_path, "anyone?", .{ .deadline_ns = 3 * std.time.ns_per_s });
+    try testing.expectError(error.KeepaliveTimeout, result);
+}

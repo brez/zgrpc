@@ -71,6 +71,26 @@ pub const default_max_frame_size: u32 = 16_384;
 /// error next to its flow-control window.
 pub const max_header_list_size: u32 = 64 * 1024;
 
+/// Liveness checking by HTTP/2 PING.
+///
+/// A peer that vanishes without closing — power loss, a dropped route, a
+/// NAT mapping that expired — sends nothing, and TCP will not say so for hours.
+/// Every connection slot such a peer holds is lost, and every call waiting on
+/// it waits forever. So when nothing at all has arrived for `interval_ns`, a
+/// PING goes out, and if still nothing arrives within `timeout_ns` the
+/// connection is declared dead with `error.KeepaliveTimeout`.
+///
+/// Any frame counts as proof of life, not only the PING's ack: a peer busy
+/// sending us data is plainly alive.
+///
+/// Mind the peer's tolerance. grpc-go servers answer pings sent more often
+/// than every five minutes with GOAWAY(ENHANCE_YOUR_CALM), so a client
+/// talking to one should not go below that.
+pub const Keepalive = struct {
+    interval_ns: u64,
+    timeout_ns: u64,
+};
+
 /// HEADERS frames one stream may carry: the initial block, and trailers.
 const max_header_blocks_per_stream = 2;
 
@@ -514,6 +534,14 @@ pub const Connection = struct {
 
     reader_task: ?std.Io.Future(void) = null,
 
+    /// Set before `start`. Null disables keepalive.
+    keepalive: ?Keepalive = null,
+    keepalive_task: ?std.Io.Future(void) = null,
+    /// Frames the reader has seen. The keepalive task compares snapshots of
+    /// this rather than reading a clock per frame, which keeps the cost of
+    /// liveness tracking off the path every call takes.
+    frames_received: std.atomic.Value(u64) = .init(0),
+
     /// `allocator` must be thread-safe: the reader task and every caller
     /// allocate from it concurrently.
     pub fn init(
@@ -539,6 +567,9 @@ pub const Connection = struct {
     /// address — the task holds a pointer to it.
     pub fn start(self: *Connection) !void {
         self.reader_task = try self.io.concurrent(readLoop, .{self});
+        if (self.keepalive != null) {
+            self.keepalive_task = try self.io.concurrent(keepaliveLoop, .{self});
+        }
     }
 
     /// Stops the reader and wakes everything waiting on this connection.
@@ -546,6 +577,10 @@ pub const Connection = struct {
     /// Idempotent, and safe to call with calls still in flight: they see the
     /// connection closed and unwind.
     pub fn shutdown(self: *Connection) void {
+        if (self.keepalive_task) |*task| {
+            _ = task.cancel(self.io);
+            self.keepalive_task = null;
+        }
         if (self.reader_task) |*task| {
             _ = task.cancel(self.io);
             self.reader_task = null;
@@ -1037,6 +1072,57 @@ pub const Connection = struct {
         }
     }
 
+    /// The keepalive task; see `Keepalive`. Runs until the connection ends or
+    /// it is cancelled.
+    ///
+    /// Marking the connection closed is enough to act on a dead peer: callers
+    /// are woken and see the error, and `acceptStream` returns it, which ends
+    /// a server's connection and frees its slot. The reader stays parked in
+    /// its read until `shutdown` cancels it.
+    ///
+    /// Not covered: a PING that cannot be written because the peer has stopped
+    /// draining TCP blocks here like any other write.
+    fn keepaliveLoop(self: *Connection) void {
+        const ka = self.keepalive.?;
+        var seen = self.frames_received.load(.monotonic);
+        while (true) {
+            std.Io.sleep(self.io, .fromNanoseconds(@intCast(ka.interval_ns)), .awake) catch return;
+            if (self.isClosed()) return;
+
+            var now = self.frames_received.load(.monotonic);
+            if (now != seen) {
+                seen = now;
+                continue;
+            }
+
+            self.sendPing() catch |err| {
+                if (err != error.Canceled) self.markClosed(err);
+                return;
+            };
+            std.Io.sleep(self.io, .fromNanoseconds(@intCast(ka.timeout_ns)), .awake) catch return;
+
+            now = self.frames_received.load(.monotonic);
+            if (now != seen) {
+                seen = now;
+                continue;
+            }
+            self.markClosed(error.KeepaliveTimeout);
+            return;
+        }
+    }
+
+    fn sendPing(self: *Connection) !void {
+        try self.writeFrame(.PING, 0, 0, &([_]u8{0} ** 8));
+        try self.flush();
+    }
+
+    fn isClosed(self: *Connection) bool {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.closed;
+    }
+
     fn sawGoAway(self: *Connection) bool {
         const io = self.io;
         self.mutex.lockUncancelable(io);
@@ -1053,6 +1139,8 @@ pub const Connection = struct {
         // next read blocks, which is the moment deferred wakeups are owed.
         if (self.reader.bufferedLen() < frame_header_len) self.flushWakes();
         const header = try FrameHeader.read(self.reader);
+        // Single writer, so a plain load and store beat a locked add.
+        self.frames_received.store(self.frames_received.load(.monotonic) +% 1, .monotonic);
         // Checked before the length sizes a buffer: it is the peer's number,
         // and we told it the limit in SETTINGS (RFC 9113 4.2).
         if (header.length > default_max_frame_size) return error.FrameSizeError;

@@ -225,11 +225,17 @@ compressed (CONTINUATION floods) and decoded (HPACK back-reference expansion),
 `SETTINGS_MAX_HEADER_LIST_SIZE` is advertised, and a stream carries at most two
 HEADERS frames. Each has a unit test in h2.zig that failed first.
 
+Keepalive is done, both sides, as HTTP/2 PING: silent for `interval_ns`, then a
+PING, then `error.KeepaliveTimeout` if nothing at all arrives within
+`timeout_ns` (any frame counts). Server default 30s/10s, which is what frees the
+slot of a vanished client. Client default is 6min/20s, deliberately slow:
+grpc-go servers send GOAWAY(ENHANCE_YOUR_CALM) for pings under 5min apart, so
+lower it only against zgrpc peers. No `SO_KEEPALIVE` and no idle-connection
+timeout — pooled connections are meant to sit idle, and PING already covers the
+dead-peer case. A PING write stuck behind a peer that has stopped draining TCP
+blocks the task, so that case is still uncovered.
+
 Found by reading the source (not exploited), in the order to do them:
-- Keepalive and idle timeout: nothing sends PING and there is no
-  `SO_KEEPALIVE`, so a vanished client holds one of the 128 connection slots
-  forever. `deadline_ns` defaulting to null means a call can wait forever on a
-  half-open connection.
 - Graceful server shutdown: `Server.deinit` cancels connections and the server
   never sends GOAWAY, so in-flight calls are cut.
 - Custom metadata: `CallOptions` carries only a deadline, so a client cannot

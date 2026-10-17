@@ -203,6 +203,10 @@ pub const Options = struct {
     /// `2 * io_buffer_bytes`, and accepting without a bound lets a peer decide
     /// how much of both to spend.
     max_concurrent_connections: usize = 128,
+    /// Drops a peer that stops answering, which is what frees the slot of a
+    /// client that vanished. Null disables it, and a vanished client then holds
+    /// its slot until the kernel gives up on the socket, which is hours.
+    keepalive: ?h2.Keepalive = .{ .interval_ns = 30 * std.time.ns_per_s, .timeout_ns = 10 * std.time.ns_per_s },
 };
 
 pub const Server = struct {
@@ -296,6 +300,7 @@ pub const Server = struct {
             error.ConnectionResetByPeer,
             error.Canceled,
             => {},
+            error.KeepaliveTimeout => log.info("dropped a peer that stopped answering", .{}),
             else => log.warn("connection failed: {t}", .{err}),
         };
     }
@@ -336,6 +341,8 @@ pub const Server = struct {
             true,
         );
         defer conn.deinit();
+
+        conn.keepalive = self.options.keepalive;
 
         // The preface is read on this task, before the reader starts: it is
         // not a frame, and letting the frame loop try to parse it would turn a

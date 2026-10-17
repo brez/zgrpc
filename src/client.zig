@@ -30,6 +30,14 @@ pub const Options = struct {
     io_buffer_bytes: usize = 64 * 1024,
     /// Sent as `user-agent`; some servers log or gate on it.
     user_agent: []const u8 = "grpc-zig/0.1",
+    /// Gives up on a server that stops answering, failing waiting calls with
+    /// `error.KeepaliveTimeout`. Null disables it, and a call without a
+    /// deadline then waits on a half-open connection forever.
+    ///
+    /// The interval sits just above five minutes because grpc-go servers treat
+    /// pings more frequent than that as abuse and send GOAWAY. Lower it when
+    /// the peer is known to be zgrpc or to allow it.
+    keepalive: ?h2.Keepalive = .{ .interval_ns = 6 * std.time.ns_per_min, .timeout_ns = 20 * std.time.ns_per_s },
 };
 
 pub const CallOptions = struct {
@@ -227,6 +235,7 @@ pub const Client = struct {
             .writer = writer,
         };
 
+        self.conn.keepalive = options.keepalive;
         try self.conn.sendClientPreface();
         try self.conn.flush();
         // Only now, with the client at its final address: the reader task
