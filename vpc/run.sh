@@ -9,7 +9,7 @@
 #   RATES="500 2000 5000"   open-loop total calls/s; keep them under what the
 #                 closed-loop rows show the pair can sustain
 #
-# The label should say the placement, e.g. same-az-c7g.large.
+# The label should say the placement, e.g. same-zone-<machine-type> or lan-wired.
 set -euo pipefail
 
 target="${1:?usage: run.sh <ip:port> <label> [vpc_bench]}"

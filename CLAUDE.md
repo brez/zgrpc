@@ -217,9 +217,9 @@ p99/p999 are not).
 
 Next up:
 - Run `vpc/run.sh` between two machines on wired Ethernet, as a real-network
-  check ahead of the VPC run. Not the milestone-2 number.
-- Make `vpc/README.md` cloud-neutral (it says "security group", "AZ"); it was
-  written assuming AWS, and where the TSDB consumer runs is not yet recorded.
+  check ahead of the VPC run. Not the milestone-2 number. `vpc/README.md` is
+  cloud-neutral and covers this case; where the TSDB consumer runs is still
+  not recorded, and that decides which placement the milestone-2 run uses.
 
 Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused
 before their length sizes a buffer, a header block is capped at 64KB both
@@ -282,4 +282,4 @@ during an outage; the defaults are far above ordinary traffic and `null` turns
 it off. The client has no such limit — nothing a server does is worth one yet.
 
 Every item the source-reading pass found is now done. What is left is the
-milestone-2 in-VPC numbers and the two "Next up" items above.
+milestone-2 in-VPC numbers and the "Next up" item above.

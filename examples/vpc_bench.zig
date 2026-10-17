@@ -1,8 +1,8 @@
 //! Client half of the in-VPC benchmark: the milestone-2 measurement.
 //!
 //! Run `vpc_server` on one host and this on another, in the placement you want
-//! to know about (same AZ, cross-AZ). `examples/bench.zig` is the loopback
-//! floor; this adds the network.
+//! to know about (same zone, cross-zone, a wired LAN). `examples/bench.zig` is
+//! the loopback floor; this adds the network.
 //!
 //!   vpc_bench --target 10.0.1.5:50051 [--payload 1024] [--callers 1]
 //!             [--pool 4] [--duration 30] [--warmup 5] [--rate 0]
