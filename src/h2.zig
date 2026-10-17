@@ -91,6 +91,21 @@ pub const Keepalive = struct {
     timeout_ns: u64,
 };
 
+/// Opaque payload of the PING that ends the first phase of a drain. Distinct
+/// from the keepalive PING's zeros, so neither mistakes the other's ack.
+const drain_ping = "zgrpcdrn".*;
+
+/// How far a connection has got in shutting itself down gracefully.
+const Drain = enum {
+    none,
+    /// GOAWAY with the maximum stream id has gone out, followed by a PING. Streams
+    /// the peer opened before it sees that are still accepted.
+    announced,
+    /// The PING came back, so every stream the peer will ever get past us is
+    /// known, and the real last id has been sent. Nothing newer is accepted.
+    final,
+};
+
 /// HEADERS frames one stream may carry: the initial block, and trailers.
 const max_header_blocks_per_stream = 2;
 
@@ -510,6 +525,7 @@ pub const Connection = struct {
     last_peer_stream_id: u32 = 0,
 
     goaway_received: ?GoAway = null,
+    drain: Drain = .none,
     /// Set when the reader stops, for any reason. Everything waiting is woken.
     closed: bool = false,
     /// Why the reader stopped, if it was not an orderly end.
@@ -713,7 +729,7 @@ pub const Connection = struct {
                 if (self.read_error) |err| return err;
                 return null;
             }
-            if (self.goaway_received != null) return null;
+            if (self.goaway_received != null or self.drain == .final) return null;
             try self.accept_ready.wait(io, &self.mutex, .none);
         }
     }
@@ -991,6 +1007,45 @@ pub const Connection = struct {
         try self.writeFrame(.RST_STREAM, 0, stream_id, &payload);
     }
 
+    /// Starts a graceful shutdown: tells the peer to open no more streams, and
+    /// lets the ones already running finish.
+    ///
+    /// Two steps, as RFC 9113 6.8 recommends. A GOAWAY naming the last stream we
+    /// have seen can cross a new stream the peer is opening right then, and the
+    /// peer would have it refused with nothing to say it was safe to retry. So
+    /// the first GOAWAY names no limit, a PING follows it, and only when the
+    /// PING's ack proves the peer has seen the GOAWAY does the second one name
+    /// the real last stream. That happens on the reader task, in `finishDrain`.
+    ///
+    /// After the second GOAWAY `acceptStream` returns null, so a server's
+    /// accept loop ends and waits for its calls.
+    pub fn beginDrain(self: *Connection) !void {
+        {
+            const io = self.io;
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.drain != .none or self.closed) return;
+            self.drain = .announced;
+        }
+        try self.sendGoAway(0x7fff_ffff, error_code_no_error);
+        try self.writeFrame(.PING, 0, 0, &drain_ping);
+        try self.flush();
+    }
+
+    fn finishDrain(self: *Connection) !void {
+        const last = blk: {
+            const io = self.io;
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.drain != .announced) return;
+            self.drain = .final;
+            self.wake_accept = true;
+            break :blk self.last_peer_stream_id;
+        };
+        try self.sendGoAway(last, error_code_no_error);
+        try self.flush();
+    }
+
     pub fn sendGoAway(self: *Connection, last_stream_id: u32, code: u32) !void {
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], last_stream_id, .big);
@@ -1065,10 +1120,12 @@ pub const Connection = struct {
                     return;
                 },
             };
-            if (self.sawGoAway()) {
-                self.markClosed(null);
-                return;
-            }
+            // No exit on GOAWAY. It means "no new streams", not "stop": calls
+            // already running are owed their responses, and a peer draining
+            // gracefully still needs its PING answered before it sends the
+            // final GOAWAY. The reader ends when the peer closes the socket,
+            // which a draining peer does as soon as it has finished; callers
+            // are kept off the connection meanwhile by `isUsable`.
         }
     }
 
@@ -1123,13 +1180,6 @@ pub const Connection = struct {
         return self.closed;
     }
 
-    fn sawGoAway(self: *Connection) bool {
-        const io = self.io;
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.goaway_received != null;
-    }
-
     /// Reads and dispatches exactly one frame.
     ///
     /// `anyerror` so `readLoop` can name the disconnect cases explicitly; the
@@ -1162,7 +1212,10 @@ pub const Connection = struct {
                 try self.flush();
             },
             .PING => {
-                if (header.flags.has(FrameFlags.ACK)) return;
+                if (header.flags.has(FrameFlags.ACK)) {
+                    if (std.mem.eql(u8, frame.payload, &drain_ping)) try self.finishDrain();
+                    return;
+                }
                 try self.writeFrame(.PING, FrameFlags.ACK, 0, frame.payload);
                 try self.flush();
             },
@@ -1243,6 +1296,19 @@ pub const Connection = struct {
             .last_stream_id = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7fff_ffff,
             .error_code = std.mem.readInt(u32, frame.payload[4..8], .big),
         };
+        // Streams we opened past the last one the peer processed will never be
+        // answered. Failing them now beats leaving their callers to wait for
+        // a deadline that may not exist.
+        const last = self.goaway_received.?.last_stream_id;
+        const ours_parity: u32 = if (self.is_server) 0 else 1;
+        var it = self.streams.valueIterator();
+        while (it.next()) |stream| {
+            const s = stream.*;
+            if (s.id % 2 == ours_parity and s.id > last) {
+                s.reset = true;
+                try self.noteWake(s.id);
+            }
+        }
         self.wake_flow = true;
         self.wake_accept = true;
     }
@@ -1285,7 +1351,9 @@ pub const Connection = struct {
                 const peer_initiated = if (self.is_server) id % 2 == 1 else id % 2 == 0;
                 if (!peer_initiated or id <= self.last_peer_stream_id) return;
 
-                if (self.streams.count() >= default_max_concurrent_streams) {
+                // Past the final GOAWAY. The peer has been told, and a stream
+                // it opened anyway is refused rather than quietly served.
+                if (self.drain == .final or self.streams.count() >= default_max_concurrent_streams) {
                     refuse = true;
                     break :blk null;
                 }
@@ -1585,4 +1653,56 @@ test "a stream cannot carry more than a header block and its trailers" {
     try conn.readFrame();
     try conn.readFrame();
     try testing.expectError(error.ProtocolError, conn.readFrame());
+}
+
+test "a GOAWAY resets the streams we opened past its last stream id" {
+    var r = std.Io.Reader.fixed("");
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, false);
+    defer conn.deinit();
+
+    // Streams 1 and 3 are ours. The peer says it processed up to 1, so 3 was
+    // never seen and nothing will ever answer it.
+    for ([_]u32{ 1, 3 }) |id| {
+        const stream = try testing.allocator.create(Stream);
+        stream.* = .{ .conn = &conn, .id = id, .send_window = protocol_initial_window };
+        try conn.streams.put(testing.allocator, id, stream);
+    }
+
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], 1, .big);
+    std.mem.writeInt(u32, payload[4..8], 0, .big);
+    try conn.applyGoAway(.{
+        .header = .{ .length = 8, .frame_type = .GOAWAY, .flags = FrameFlags.init(0), .reserved = false, .stream_id = 0 },
+        .payload = &payload,
+    });
+
+    try testing.expect(!conn.streams.get(1).?.reset);
+    try testing.expect(conn.streams.get(3).?.reset);
+}
+
+test "a reader keeps answering after GOAWAY" {
+    // GOAWAY, then a PING. A draining peer sends exactly this and waits for
+    // the ack before naming its final stream, so a reader that stopped at the
+    // GOAWAY would leave it waiting forever.
+    var bytes: [9 + 8 + 9 + 8]u8 = undefined;
+    testFrameHeader(bytes[0..9], 8, .GOAWAY, 0, 0);
+    std.mem.writeInt(u32, bytes[9..13], 0x7fff_ffff, .big);
+    std.mem.writeInt(u32, bytes[13..17], 0, .big);
+    testFrameHeader(bytes[17..26], 8, .PING, 0, 0);
+    @memcpy(bytes[26..34], &drain_ping);
+
+    var r = std.Io.Reader.fixed(&bytes);
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, false);
+    defer conn.deinit();
+
+    conn.readLoop(); // returns at end of input
+
+    const written = w.buffered();
+    try testing.expect(written.len >= 17);
+    try testing.expectEqual(@intFromEnum(FrameType.PING), written[3]);
+    try testing.expectEqual(@as(u8, FrameFlags.ACK), written[4]);
 }

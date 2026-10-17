@@ -222,6 +222,14 @@ pub const Server = struct {
     /// Free connection slots; see `Options.max_concurrent_connections`.
     slots: std.Io.Semaphore,
 
+    /// Connections being served, so `shutdown` can reach them. A connection
+    /// lives on its own task's stack, which is why this holds pointers and why
+    /// removal (under the same mutex) happens before that stack goes away.
+    registry_mutex: std.Io.Mutex = .init,
+    registry: std.ArrayList(*h2.Connection) = .empty,
+    /// Connection tasks still running, for `shutdown` to wait on.
+    live: std.atomic.Value(u32) = .init(0),
+
     pub fn listen(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -250,6 +258,37 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.connections.cancel(self.io);
         self.net_server.deinit(self.io);
+        self.registry.deinit(self.allocator);
+    }
+
+    /// Stops serving gracefully: connections are told to open no more calls,
+    /// and calls already running get up to `grace_ns` to finish. Returns true
+    /// if every connection ended within that time.
+    ///
+    /// Stop the task running `serve` first; this does not stop accepting. What
+    /// outlasts the grace period is left running, and `deinit` is what cuts it.
+    /// Clients see GOAWAY, finish their calls, and stop using the connection,
+    /// so a rolling restart costs them nothing.
+    pub fn shutdown(self: *Server, grace_ns: u64) bool {
+        const io = self.io;
+        {
+            self.registry_mutex.lockUncancelable(io);
+            defer self.registry_mutex.unlock(io);
+            // Under the mutex, because a connection leaves the registry before
+            // its stack goes away and this must not touch one that has gone.
+            for (self.registry.items) |conn| conn.beginDrain() catch {};
+        }
+
+        const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{
+            .raw = .fromNanoseconds(@intCast(grace_ns)),
+            .clock = .awake,
+        });
+        while (true) {
+            const remaining = self.live.load(.acquire);
+            if (remaining == 0) return true;
+            if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return false;
+            io.futexWaitTimeout(u32, &self.live.raw, remaining, .{ .deadline = deadline }) catch return false;
+        }
     }
 
     /// Accepts connections until cancelled, serving each on its own unit of
@@ -258,8 +297,16 @@ pub const Server = struct {
     /// Returns `error.Canceled` when the caller cancels it, which is the
     /// ordinary way to stop a server rather than a failure.
     pub fn serve(self: *Server) !void {
-        errdefer self.connections.cancel(self.io);
+        // Being cancelled is how a graceful shutdown starts, so it must leave
+        // the connections alone: `shutdown` drains them and `deinit` cuts
+        // whatever is left. Any other failure is the server itself breaking.
+        self.serveLoop() catch |err| {
+            if (err != error.Canceled) self.connections.cancel(self.io);
+            return err;
+        };
+    }
 
+    fn serveLoop(self: *Server) !void {
         while (true) {
             // Taken before the accept, not after: waiting here leaves an
             // over-quota connection in the kernel's backlog, where the peer
@@ -289,6 +336,13 @@ pub const Server = struct {
     /// returned: nothing is waiting on an individual connection's outcome, and
     /// one peer hanging up must not stop the server.
     fn connectionTask(self: *Server, stream: std.Io.net.Stream) void {
+        _ = self.live.fetchAdd(1, .acq_rel);
+        // Last, after the socket is closed and the slot returned, so a
+        // `shutdown` that sees zero is looking at a finished connection.
+        defer {
+            _ = self.live.fetchSub(1, .acq_rel);
+            self.io.futexWake(u32, &self.live.raw, std.math.maxInt(u32));
+        }
         defer self.slots.post(self.io);
         defer stream.close(self.io);
 
@@ -352,6 +406,11 @@ pub const Server = struct {
         try conn.flush();
         try conn.start();
 
+        // Registered only once started and removed before `conn` is torn down,
+        // so `shutdown` never holds a pointer to a connection that is going.
+        try self.register(&conn);
+        defer self.unregister(&conn);
+
         // Declared after `conn` so it is cancelled first: a call task holds a
         // pointer to the connection.
         var calls: std.Io.Group = .init;
@@ -367,6 +426,23 @@ pub const Server = struct {
         }
 
         try calls.await(self.io);
+    }
+
+    fn register(self: *Server, conn: *h2.Connection) !void {
+        self.registry_mutex.lockUncancelable(self.io);
+        defer self.registry_mutex.unlock(self.io);
+        try self.registry.append(self.allocator, conn);
+    }
+
+    fn unregister(self: *Server, conn: *h2.Connection) void {
+        self.registry_mutex.lockUncancelable(self.io);
+        defer self.registry_mutex.unlock(self.io);
+        for (self.registry.items, 0..) |c, i| {
+            if (c == conn) {
+                _ = self.registry.swapRemove(i);
+                return;
+            }
+        }
     }
 
     /// One call. Errors are logged rather than returned: a call is not what

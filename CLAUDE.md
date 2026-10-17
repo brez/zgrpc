@@ -235,9 +235,20 @@ timeout — pooled connections are meant to sit idle, and PING already covers th
 dead-peer case. A PING write stuck behind a peer that has stopped draining TCP
 blocks the task, so that case is still uncovered.
 
+Graceful shutdown is done: cancel the task running `serve`, call
+`Server.shutdown(grace_ns)`, then `deinit`. Each connection sends GOAWAY naming
+no limit plus a PING, and only when the ack proves the peer has seen it sends
+the real last stream id (RFC 9113 6.8, so a stream opened mid-flight is not
+refused unretryably). Calls in flight finish within the grace period;
+`shutdown` returns false if some outlast it and `deinit` cuts those. Two
+behaviours changed to make it work: cancelling `serve` no longer tears down its
+connections (only `deinit` and a real accept failure do), and a reader no
+longer stops on GOAWAY — it runs until the peer closes, answering PINGs, and
+streams we opened past the GOAWAY's last id fail at once. Not checked against
+a grpc-go client; interop only covers grpc-go as the other side of unary and
+streaming calls.
+
 Found by reading the source (not exploited), in the order to do them:
-- Graceful server shutdown: `Server.deinit` cancels connections and the server
-  never sends GOAWAY, so in-flight calls are cut.
 - Custom metadata: `CallOptions` carries only a deadline, so a client cannot
   send auth or trace headers, and a handler cannot set response headers or
   trailers beyond status. Check whether the TSDB needs this before it depends

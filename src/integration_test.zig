@@ -1198,3 +1198,135 @@ test "a client gives up on a server that stops answering" {
     const result = client.call(echo_path, "anyone?", .{ .deadline_ns = 3 * std.time.ns_per_s });
     try testing.expectError(error.KeepaliveTimeout, result);
 }
+
+// -- graceful shutdown -------------------------------------------------------
+
+fn slowCallTask(client: *zgrpc.Client, finished_ok: *std.atomic.Value(bool)) void {
+    var response = client.call(slow_path, "in flight", .{}) catch return;
+    defer response.deinit();
+    finished_ok.store(
+        response.call_status.code == .ok and std.mem.eql(u8, response.message, "in flight"),
+        .release,
+    );
+}
+
+fn shutdownTask(server: *zgrpc.Server, grace_ns: u64, clean: *std.atomic.Value(u8)) void {
+    clean.store(if (server.shutdown(grace_ns)) 1 else 2, .release);
+}
+
+const ShutdownFixture = struct {
+    threaded: std.Io.Threaded,
+    server: *zgrpc.Server,
+    serving: std.Io.Future(void),
+    client: *zgrpc.Client,
+    authority: []u8,
+
+    fn start(self: *ShutdownFixture, allocator: std.mem.Allocator) !void {
+        self.threaded = std.Io.Threaded.init(allocator, .{});
+        const io = self.threaded.io();
+        self.server = try allocator.create(zgrpc.Server);
+        self.server.* = try zgrpc.Server.listen(
+            allocator,
+            io,
+            std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            &methods,
+            .{},
+        );
+        const bound = self.server.boundAddress();
+        self.authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+        self.serving = try io.concurrent(serveTask, .{self.server});
+        self.client = try zgrpc.Client.connect(allocator, io, bound, self.authority, .{});
+    }
+
+    fn deinit(self: *ShutdownFixture, allocator: std.mem.Allocator) void {
+        self.client.deinit();
+        self.server.deinit();
+        allocator.destroy(self.server);
+        allocator.free(self.authority);
+        self.threaded.deinit();
+    }
+};
+
+fn waitUnusable(client: *zgrpc.Client, io: std.Io, limit_ms: usize) bool {
+    var waited: usize = 0;
+    while (waited < limit_ms) : (waited += 5) {
+        if (!client.isUsable()) return true;
+        std.Io.sleep(io, .fromMilliseconds(5), .awake) catch return false;
+    }
+    return !client.isUsable();
+}
+
+test "shutdown lets a call in flight finish and refuses new ones" {
+    const allocator = testing.allocator;
+    var fx: ShutdownFixture = undefined;
+    try fx.start(allocator);
+    defer fx.deinit(allocator);
+    const io = fx.threaded.io();
+
+    var finished_ok: std.atomic.Value(bool) = .init(false);
+    var calls: std.Io.Group = .init;
+    try calls.concurrent(io, slowCallTask, .{ fx.client, &finished_ok });
+
+    // Let the call reach the handler, which then sleeps for a second.
+    try std.Io.sleep(io, .fromMilliseconds(150), .awake);
+
+    _ = fx.serving.cancel(io);
+    var clean: std.atomic.Value(u8) = .init(0);
+    try calls.concurrent(io, shutdownTask, .{ fx.server, 5 * std.time.ns_per_s, &clean });
+
+    // The client hears GOAWAY while its call is still running, and from then
+    // on will not start another on this connection.
+    try testing.expect(waitUnusable(fx.client, io, 500));
+    try testing.expectEqual(@as(u8, 0), clean.load(.acquire)); // still draining
+    try testing.expectError(error.ConnectionClosed, fx.client.call(echo_path, "late", .{}));
+
+    try calls.await(io);
+    // The point of the whole exercise: the call that was running was not cut.
+    try testing.expect(finished_ok.load(.acquire));
+    try testing.expectEqual(@as(u8, 1), clean.load(.acquire));
+}
+
+test "shutdown gives up on a call that outlasts the grace period" {
+    const allocator = testing.allocator;
+    var fx: ShutdownFixture = undefined;
+    try fx.start(allocator);
+    defer fx.deinit(allocator);
+    const io = fx.threaded.io();
+
+    var finished_ok: std.atomic.Value(bool) = .init(false);
+    var calls: std.Io.Group = .init;
+    try calls.concurrent(io, slowCallTask, .{ fx.client, &finished_ok });
+    try std.Io.sleep(io, .fromMilliseconds(150), .awake);
+
+    _ = fx.serving.cancel(io);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const clean = fx.server.shutdown(100 * std.time.ns_per_ms);
+    const took_ms = @divTrunc(started.durationFromNow(io).raw.nanoseconds * -1, std.time.ns_per_ms);
+
+    try testing.expect(!clean);
+    // Bounded by the grace period, not by the one-second handler.
+    try testing.expect(took_ms < 700);
+
+    // What outlasted the grace period is cut by the fixture's `deinit`.
+    calls.cancel(io);
+}
+
+test "shutdown with nothing in flight returns at once" {
+    const allocator = testing.allocator;
+    var fx: ShutdownFixture = undefined;
+    try fx.start(allocator);
+    defer fx.deinit(allocator);
+    const io = fx.threaded.io();
+
+    {
+        var response = try fx.client.call(echo_path, "warm", .{});
+        defer response.deinit();
+    }
+
+    _ = fx.serving.cancel(io);
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expect(fx.server.shutdown(5 * std.time.ns_per_s));
+    const took_ms = @divTrunc(started.durationFromNow(io).raw.nanoseconds * -1, std.time.ns_per_ms);
+    try testing.expect(took_ms < 1000);
+    try testing.expect(waitUnusable(fx.client, io, 1000));
+}
