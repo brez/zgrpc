@@ -256,8 +256,16 @@ not built: response headers and trailers set by a handler, readable by a
 client, and binary (`-bin`) metadata. harvezter's CLAUDE.md states no need for
 either — one trusted VPC, no auth — so they wait for a stated use.
 
+The smaller items are settled. A request with a `grpc-encoding` other than
+identity now gets UNIMPLEMENTED (it was INTERNAL), so a caller can tell the
+encoding is at fault; checked against grpc-go with gzip. Compression itself is
+still unsupported, and a client receiving a compressed message still gets
+`error.CompressionNotSupported`. Unexpected handler errors are now logged
+server-side with the method path; callers still see `@errorName(err)` as the
+INTERNAL message, which is useful in a trusted VPC and worth revisiting before
+anything leaves it. Metrics and logging hooks are not built: they are
+interceptor-shaped, which the scope rules exclude, and no consumer has asked.
+
 Found by reading the source (not exploited), in the order to do them:
-- Smaller: handler errors reach the caller as `@errorName(err)`; compression
-  is unsupported (`CompressionNotSupported`); no metrics or logging hooks.
 - Not yet checked: rapid-reset behaviour under load, since stream handlers are
   launched before a RST_STREAM can cancel them.

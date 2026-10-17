@@ -503,6 +503,23 @@ pub const Server = struct {
             return;
         };
 
+        // Only identity is spoken. A request in any other encoding gets the
+        // answer the spec prescribes, so its sender can tell that the
+        // encoding is the problem and retry without it; reading on would just
+        // misparse compressed bytes as a message.
+        if (headers.get("grpc-encoding")) |encoding| {
+            if (!std.mem.eql(u8, encoding, "identity")) {
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "unsupported grpc-encoding \"{s}\"; only identity is supported",
+                    .{encoding},
+                );
+                defer self.allocator.free(message);
+                try self.respondStatusOnly(conn, stream.id, .{ .code = .unimplemented, .message = message });
+                return;
+            }
+        }
+
         // The clock starts here, on the first thing the server does with the
         // call, so that everything after it is inside the budget.
         const deadline: ?std.Io.Clock.Timestamp = deadline: {
@@ -529,7 +546,10 @@ pub const Server = struct {
                         error.DeadlineExceeded => .deadline_exceeded,
                         else => .internal,
                     },
-                    .message = @errorName(err),
+                    .message = if (err == error.CompressedWithoutEncoding)
+                        "compressed message without grpc-encoding"
+                    else
+                        @errorName(err),
                 });
                 return;
             };
@@ -629,7 +649,9 @@ pub const Server = struct {
                 .data => |n| {
                     decoder.commit(n);
                     if (try decoder.next()) |msg| {
-                        if (msg.compressed) return error.CompressionNotSupported;
+                        // Any real encoding was refused before getting here, so
+                        // a set flag has nothing to say what it means.
+                        if (msg.compressed) return error.CompressedWithoutEncoding;
                         // Copied out: the decoder's buffer is reused, and the
                         // handler may hold this for the whole call.
                         return try arena.dupe(u8, msg.payload);
@@ -658,6 +680,11 @@ pub const Server = struct {
     fn failureStatus(ctx: *const CallContext, err: anyerror) Status {
         if (!ctx.status.isOk()) return ctx.status;
         if (err == error.DeadlineExceeded) return deadline_status;
+        // The caller gets the error's name; the operator gets to know it
+        // happened, which nothing else would tell them. A handler that fails
+        // on purpose goes through `ctx.fail` and is not an event worth a log
+        // line, and a call that ran out of time or was cancelled is ordinary.
+        if (err != error.StreamReset and err != error.Canceled) log.warn("handler for {s} failed: {t}", .{ ctx.path, err });
         return .{ .code = .internal, .message = @errorName(err) };
     }
 

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -345,7 +346,23 @@ func main() {
 		return nil
 	}())
 
-	// 13. grpc-go picks its own units for `grpc-timeout` — it sends whatever
+	// 13. A gzip-enabled client. grpc-go sends `grpc-encoding: gzip` and a
+	//     compressed message; the server speaks only identity, and the spec's
+	//     answer to that is UNIMPLEMENTED, not INTERNAL, so the caller can tell
+	//     the encoding is what to change.
+	check("a gzip-compressed request is UNIMPLEMENTED", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var resp []byte
+		req := []byte("compress me, compress me, compress me")
+		err := cc.Invoke(ctx, "/zgrpc.test.Echo/Call", &req, &resp, grpc.UseCompressor("gzip"))
+		if got := status.Code(err); got != codes.Unimplemented {
+			return fmt.Errorf("got %v (%v), want Unimplemented", got, err)
+		}
+		return nil
+	}())
+
+	// 14. grpc-go picks its own units for `grpc-timeout` — it sends whatever
 	//     of "n", "u", "m", "S"… fits the remaining time — so decoding what
 	//     *it* sends is a different check from decoding what we send.
 	check("grpc-timeout from grpc-go arrives as a usable deadline", func() error {
@@ -368,7 +385,7 @@ func main() {
 		return nil
 	}())
 
-	// 14. A call that outruns its deadline. The handler sleeps 300ms against a
+	// 15. A call that outruns its deadline. The handler sleeps 300ms against a
 	//     100ms deadline, so the status must be DeadlineExceeded and it must
 	//     arrive without waiting out the handler.
 	check("a call past its deadline fails with DEADLINE_EXCEEDED", func() error {

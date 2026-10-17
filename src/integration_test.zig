@@ -1406,3 +1406,102 @@ test "invalid metadata fails the call before anything is sent" {
     defer response.deinit();
     try testing.expectEqualStrings("after", response.message);
 }
+
+// -- compression -------------------------------------------------------------
+
+/// Sends one hand-built request, since the typed client cannot produce what a
+/// misbehaving or merely different peer would: a `grpc-encoding` header and a
+/// message whose compressed flag is set. Returns the `grpc-status` it got back.
+fn rawCallStatus(
+    client: *zgrpc.Client,
+    authority: []const u8,
+    encoding: ?[]const u8,
+    compressed_flag: u8,
+) !u32 {
+    var fields: [8]zgrpc.Header = undefined;
+    var n: usize = 0;
+    for ([_]zgrpc.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = echo_path },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "application/grpc+proto" },
+        .{ .name = "te", .value = "trailers" },
+    }) |h| {
+        fields[n] = h;
+        n += 1;
+    }
+    if (encoding) |e| {
+        fields[n] = .{ .name = "grpc-encoding", .value = e };
+        n += 1;
+    }
+
+    const stream = try client.conn.openStream(fields[0..n], false, null);
+    defer client.conn.closeStream(stream);
+    // Five-byte message header, then three bytes of "payload".
+    try client.conn.writeData(stream, &.{ compressed_flag, 0, 0, 0, 3, 'a', 'b', 'c' }, true);
+    try client.conn.flush();
+
+    var buf: [1024]u8 = undefined;
+    while (true) switch (try stream.next(&buf)) {
+        .headers => |h| {
+            var headers = h;
+            defer headers.deinit();
+            if (headers.get("grpc-status")) |text| return try std.fmt.parseInt(u32, text, 10);
+        },
+        .data => {},
+        .end => return error.NoStatus,
+    };
+}
+
+test "a request in an encoding we do not speak is UNIMPLEMENTED" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    // 12 is UNIMPLEMENTED. It tells the caller the encoding is at fault, which
+    // INTERNAL does not.
+    try testing.expectEqual(@as(u32, 12), try rawCallStatus(pair.client, pair.authority, "gzip", 1));
+}
+
+test "identity encoding is accepted" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    try testing.expectEqual(@as(u32, 0), try rawCallStatus(pair.client, pair.authority, "identity", 0));
+}
+
+test "a compressed message with no encoding named is a protocol error" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var pair = try startPair(allocator, &threaded);
+    defer {
+        pair.client.deinit();
+        pair.thread.join();
+        pair.server.deinit();
+        allocator.destroy(pair.server);
+        allocator.free(pair.authority);
+    }
+
+    // 13 is INTERNAL: nothing says what the flag means, so nothing can be done
+    // with the bytes.
+    try testing.expectEqual(@as(u32, 13), try rawCallStatus(pair.client, pair.authority, null, 1));
+}
