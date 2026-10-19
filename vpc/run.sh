@@ -14,7 +14,11 @@ set -euo pipefail
 
 target="${1:?usage: run.sh <ip:port> <label> [vpc_bench]}"
 label="${2:?usage: run.sh <ip:port> <label> [vpc_bench]}"
-bench="${3:-$(dirname "${BASH_SOURCE[0]}")/../zig-out/bin/vpc_bench}"
+here="$(dirname "${BASH_SOURCE[0]}")"
+# Next to this script (scp'd to a bare host), else the repo's build output.
+if [ -x "$here/vpc_bench" ]; then default_bench="$here/vpc_bench"; else default_bench="$here/../zig-out/bin/vpc_bench"; fi
+bench="${3:-$default_bench}"
+[ -x "$bench" ] || { echo "vpc_bench not found at $bench; pass its path as the third argument" >&2; exit 1; }
 reps="${REPS:-3}"
 duration="${DURATION:-30}"
 rates="${RATES:-500 2000 5000}"
@@ -28,7 +32,12 @@ out="vpc-$label-$(date -u +%Y%m%dT%H%M%SZ).txt"
     echo "# client $(uname -m) $(nproc) cpus, $(hostname)"
     echo
     echo "# network floor: ICMP RTT to $host (the budget the RPC cannot beat)"
-    ping -c 200 -i 0.05 -q "$host" 2>&1 | tail -2 || echo "# ping unavailable"
+    # Intervals under 200ms need root; fall back to passwordless sudo.
+    if rtt=$(ping -c 200 -i 0.05 -q "$host" 2>&1 || sudo -n ping -c 200 -i 0.05 -q "$host" 2>&1); then
+        echo "$rtt" | tail -2
+    else
+        echo "# ping unavailable: $(echo "$rtt" | tail -1)"
+    fi
     echo
 } | tee "$out"
 

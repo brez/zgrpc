@@ -23,7 +23,9 @@ runs in the placement the consumer will use are the milestone-2 number.
    ICMP, or `run.sh` has no network floor to report. Addresses must be IPs,
    not hostnames; use private ones.
 4. Server: `./vpc_server --listen 0.0.0.0:50051`
-5. Client: `./run.sh <server-ip>:50051 <label>`, where the label names the
+5. Client: `./run.sh <server-ip>:50051 <label>` (it uses a `vpc_bench` next to
+   it, else `zig-out/bin/`; the ICMP floor needs root or passwordless `sudo`),
+   where the label names the
    placement, e.g. `same-zone-<machine-type>` or `lan-wired`.
 
 `run.sh` writes `vpc-<label>-<timestamp>.txt` in the current directory. Per
