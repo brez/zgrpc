@@ -195,13 +195,23 @@ const Harness = struct {
 fn startPair(
     allocator: std.mem.Allocator,
     threaded: *std.Io.Threaded,
-) !struct {
+) !PairType {
+    return startPairWith(allocator, threaded, .{});
+}
+
+const PairType = struct {
     io: std.Io,
     server: *zgrpc.Server,
     thread: std.Thread,
     client: *zgrpc.Client,
     authority: []u8,
-} {
+};
+
+fn startPairWith(
+    allocator: std.mem.Allocator,
+    threaded: *std.Io.Threaded,
+    options: zgrpc.server.Options,
+) !PairType {
     const io = threaded.io();
 
     const server = try allocator.create(zgrpc.Server);
@@ -211,7 +221,7 @@ fn startPair(
         io,
         std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
         &methods,
-        .{},
+        options,
     );
 
     const bound = server.boundAddress();
@@ -251,6 +261,53 @@ test "unary call round-trips a message over real h2c" {
 
     try testing.expectEqual(zgrpc.Code.ok, response.call_status.code);
     try testing.expectEqualStrings("hello zgrpc", response.message);
+}
+
+const Counter = struct { calls: std.atomic.Value(u32) = .init(0) };
+
+fn userDataHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    const counter = ctx.userData(Counter);
+    const n = counter.calls.fetchAdd(1, .monotonic) + 1;
+    return std.fmt.allocPrint(ctx.allocator, "{d}", .{n});
+}
+
+test "handlers reach the state the server was built with" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var counter: Counter = .{};
+    const user_methods = [_]zgrpc.Method{zgrpc.Method.unary("/zgrpc.test.State/Bump", userDataHandler)};
+
+    const io = threaded.io();
+    var server = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &user_methods,
+        .{ .user_data = &counter },
+    );
+    const bound = server.boundAddress();
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    const thread = try std.Thread.spawn(.{}, Harness.serveThread, .{&server});
+    const client = try zgrpc.Client.connect(allocator, io, bound, authority, .{});
+    defer {
+        client.deinit();
+        thread.join();
+        server.deinit();
+    }
+
+    for (1..4) |i| {
+        var response = try client.call("/zgrpc.test.State/Bump", "", .{});
+        defer response.deinit();
+        var expected: [8]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{i}), response.message);
+    }
+    try testing.expectEqual(@as(u32, 3), counter.calls.load(.monotonic));
 }
 
 test "several calls reuse one connection" {
@@ -1587,4 +1644,118 @@ test "ordinary cancellation stays well inside the default limit" {
     var response = try pair.client.call(echo_path, "still here", .{});
     defer response.deinit();
     try testing.expectEqualStrings("still here", response.message);
+}
+
+// -- typed calls -------------------------------------------------------------
+
+/// Stands in for a generated message. `typed` asks for a shape, not a library,
+/// so a type with these two methods is all the test needs.
+const Text = struct {
+    body: []const u8,
+
+    pub fn encode(
+        self: Text,
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        _ = allocator;
+        try writer.writeAll(self.body);
+    }
+
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (error{InvalidInput} || std.Io.Reader.Error || std.mem.Allocator.Error)!Text {
+        const body = reader.buffered();
+        if (body.len == 0) return error.InvalidInput;
+        return .{ .body = try allocator.dupe(u8, body) };
+    }
+};
+
+const shout_path = "/zgrpc.test.Typed/Shout";
+const count_to_path = "/zgrpc.test.Typed/CountTo";
+
+fn shout(ctx: *zgrpc.CallContext, request: Text) anyerror!Text {
+    const upper = try ctx.allocator.dupe(u8, request.body);
+    for (upper) |*c| c.* = std.ascii.toUpper(c.*);
+    return .{ .body = upper };
+}
+
+fn countTo(ctx: *zgrpc.CallContext, request: Text, sender: *zgrpc.typed.Sender(Text)) anyerror!void {
+    const n = std.fmt.parseInt(usize, request.body, 10) catch
+        return ctx.fail(.invalid_argument, "not a number");
+    for (0..n) |i| {
+        var buf: [16]u8 = undefined;
+        try sender.send(.{ .body = try std.fmt.bufPrint(&buf, "item-{d}", .{i}) });
+    }
+}
+
+const typed_methods = [_]zgrpc.Method{
+    zgrpc.Method.unary(shout_path, zgrpc.typed.unaryHandler(Text, Text, shout)),
+    zgrpc.Method.serverStream(count_to_path, zgrpc.typed.serverStreamHandler(Text, Text, countTo)),
+};
+
+test "typed calls: unary, malformed input, and server streaming" {
+    const allocator = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try allocator.create(zgrpc.Server);
+    defer allocator.destroy(server);
+    server.* = try zgrpc.Server.listen(
+        allocator,
+        io,
+        std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        &typed_methods,
+        .{},
+    );
+    defer server.deinit();
+
+    const bound = server.boundAddress();
+    const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+    defer allocator.free(authority);
+
+    var serving = try io.concurrent(serveTask, .{server});
+    defer _ = serving.cancel(io);
+
+    const pool = try zgrpc.Pool.init(allocator, io, bound, authority, .{});
+    defer pool.deinit();
+
+    {
+        var reply = try zgrpc.typed.call(Text, Text, pool, allocator, shout_path, .{ .body = "hello" }, .{});
+        defer reply.deinit();
+        try testing.expect(reply.status.isOk());
+        try testing.expectEqualStrings("HELLO", reply.message.?.body);
+    }
+
+    // Bytes the message type cannot decode are the caller's mistake, and the
+    // status says so rather than blaming the server.
+    {
+        var reply = try zgrpc.typed.call(Text, Text, pool, allocator, shout_path, .{ .body = "" }, .{});
+        defer reply.deinit();
+        try testing.expectEqual(zgrpc.Code.invalid_argument, reply.status.code);
+        try testing.expect(reply.message == null);
+    }
+
+    {
+        var stream = try zgrpc.typed.callServerStream(Text, Text, pool, allocator, count_to_path, .{ .body = "3" }, .{});
+        defer stream.deinit();
+        var seen: usize = 0;
+        while (try stream.next()) |message| : (seen += 1) {
+            var buf: [16]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "item-{d}", .{seen}), message.body);
+        }
+        try testing.expectEqual(@as(usize, 3), seen);
+        try testing.expect(stream.finalStatus().isOk());
+    }
+
+    // A handler's own failure still arrives as its status, through the stream.
+    {
+        var stream = try zgrpc.typed.callServerStream(Text, Text, pool, allocator, count_to_path, .{ .body = "x" }, .{});
+        defer stream.deinit();
+        try testing.expect((try stream.next()) == null);
+        try testing.expectEqual(zgrpc.Code.invalid_argument, stream.finalStatus().code);
+    }
 }

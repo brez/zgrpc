@@ -60,6 +60,10 @@ pub const CallContext = struct {
     /// the safe direction to be wrong in.
     deadline: ?std.Io.Clock.Timestamp = null,
     request_headers: *const h2.Headers,
+    /// `Options.user_data`, passed through untouched. Handlers are plain
+    /// function pointers with no closure, so this is how one reaches the state
+    /// the server was built around; see `userData`.
+    user_data: ?*anyopaque = null,
 
     /// Status returned to the client. A handler that wants to fail with a
     /// specific code sets this and returns an empty body.
@@ -73,6 +77,13 @@ pub const CallContext = struct {
     pub fn metadata(self: *const CallContext, name: []const u8) ?[]const u8 {
         if (name.len == 0 or name[0] == ':') return null;
         return self.request_headers.get(name);
+    }
+
+    /// `Options.user_data` as the type it was set from. Asserts it was set.
+    /// The pointee outlives every call, and calls run concurrently, so it must
+    /// be safe to use from several tasks at once.
+    pub fn userData(self: *const CallContext, comptime T: type) *T {
+        return @ptrCast(@alignCast(self.user_data.?));
     }
 
     pub fn fail(self: *CallContext, code: Code, message: []const u8) error{HandlerFailed} {
@@ -221,6 +232,9 @@ pub const Options = struct {
     /// client that vanished. Null disables it, and a vanished client then holds
     /// its slot until the kernel gives up on the socket, which is hours.
     keepalive: ?h2.Keepalive = .{ .interval_ns = 30 * std.time.ns_per_s, .timeout_ns = 10 * std.time.ns_per_s },
+    /// Handed to every handler as `ctx.user_data`. The server never touches
+    /// it, and it must outlive the server.
+    user_data: ?*anyopaque = null,
 };
 
 pub const Server = struct {
@@ -575,6 +589,7 @@ pub const Server = struct {
             .path = path,
             .deadline = deadline,
             .request_headers = &headers,
+            .user_data = self.options.user_data,
         };
 
         switch (handler) {

@@ -8,6 +8,7 @@
 //!   client.zig  unary + server-streaming client, one connection
 //!   server.zig  unary + server-streaming server
 //!   pool.zig    several persistent connections to one peer
+//!   typed.zig   typed calls over message types with encode/decode methods
 
 const std = @import("std");
 
@@ -19,6 +20,7 @@ pub const timeout = @import("timeout.zig");
 pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 pub const pool = @import("pool.zig");
+pub const typed = @import("typed.zig");
 
 pub const Keepalive = h2.Keepalive;
 pub const Header = h2.Header;
@@ -34,6 +36,7 @@ pub const StreamHandler = server.StreamHandler;
 pub const ResponseStream = client.ResponseStream;
 pub const CallContext = server.CallContext;
 pub const MethodHandler = server.MethodHandler;
+pub const Reply = typed.Reply;
 
 test {
     _ = h2;
@@ -44,4 +47,5 @@ test {
     _ = client;
     _ = server;
     _ = pool;
+    _ = typed;
 }
