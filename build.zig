@@ -15,6 +15,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The stub generator. It reads protoc's descriptors, which needs
+    // zig-protobuf, so it is opt-in: a project that wants stubs builds this
+    // package with `.generator = true` and takes `artifact("protoc-gen-zgrpc")`;
+    // everyone else never fetches zig-protobuf (the dependency is lazy).
+    const generator = b.option(
+        bool,
+        "generator",
+        "Build protoc-gen-zgrpc, which fetches zig-protobuf",
+    ) orelse false;
+    const gen_exe = if (generator) addGenerator(b, target, optimize) else null;
+
     // Everything past here exists to develop zgrpc, not to use it. A project
     // that depends on this package wants the module and nothing else, and the
     // published package does not ship `examples/` or `interop/` at all — so
@@ -110,6 +121,17 @@ pub fn build(b: *std.Build) void {
     const unit_step = b.step("test-unit", "Run unit tests only");
     unit_step.dependOn(&run_mod_tests.step);
 
+    // The generator's own tests. Needs `-Dgenerator=true` because it is the
+    // generator that pulls in zig-protobuf.
+    const gen_test_step = b.step("test-gen", "Run the stub generator's tests (needs -Dgenerator=true)");
+    if (gen_exe) |exe| {
+        const gen_tests = b.addTest(.{ .root_module = exe.root_module });
+        gen_test_step.dependOn(&b.addRunArtifact(gen_tests).step);
+        test_step.dependOn(&b.addRunArtifact(gen_tests).step);
+    } else if (!generator) {
+        gen_test_step.dependOn(&b.addFail("test-gen needs -Dgenerator=true").step);
+    }
+
     const integration_step = b.step("test-integration", "Run integration tests only");
     integration_step.dependOn(&run_integration_tests.step);
 
@@ -122,4 +144,23 @@ pub fn build(b: *std.Build) void {
         "Compile integration tests without running them",
     );
     integration_build_step.dependOn(&integration_install.step);
+}
+
+fn addGenerator(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) ?*std.Build.Step.Compile {
+    const protobuf_dep = b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) orelse return null;
+    const exe = b.addExecutable(.{
+        .name = "protoc-gen-zgrpc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("gen/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "protobuf", .module = protobuf_dep.module("protobuf") }},
+        }),
+    });
+    b.installArtifact(exe);
+    return exe;
 }

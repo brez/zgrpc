@@ -18,8 +18,9 @@ trap 'rm -rf "$work"' EXIT
 
 echo "==> packing the working tree"
 # HEAD, not the dirty tree: this is what a consumer fetching a tag would get,
-# and uncommitted files are not part of any tag.
-git -C "$root" archive --format=tar.gz --prefix=zgrpc/ -o "$work/zgrpc.tar.gz" HEAD
+# and uncommitted files are not part of any tag. ZGRPC_REF names another
+# tree-ish, for checking a change before it is committed.
+git -C "$root" archive --format=tar.gz --prefix=zgrpc/ -o "$work/zgrpc.tar.gz" "${ZGRPC_REF:-HEAD}"
 
 echo "==> preparing a consumer project"
 cp -R "$root/packaging/consumer" "$work/consumer"

@@ -30,7 +30,7 @@ jobs:
         # zig-pkg/ directories, including one under examples/protobuf/, and
         # their formatting is not ours to enforce.
         run: >
-          zig fmt --check build.zig src packaging/consumer
+          zig fmt --check build.zig src gen/main.zig packaging/consumer
           examples/*.zig examples/protobuf/build.zig examples/protobuf/src
 
       - name: Build
@@ -43,12 +43,26 @@ jobs:
         # Real client/server over loopback TCP.
         run: zig build test-integration --summary all
 
+      - name: Stub generator tests
+        # The generator needs zig-protobuf, so it is opt-in; this is the only
+        # job that builds it from the root project.
+        run: zig build test-gen -Dgenerator=true --summary all
+
       - name: Protobuf example
         # Its own project, because zgrpc has no protobuf dependency and this
         # needs one. Running it here is what stops the README's protobuf
-        # snippets from rotting.
+        # snippets from rotting, and it drives the real generated stubs.
         working-directory: examples/protobuf
         run: zig build run
+
+      - name: Generated stubs are current
+        # Runs protoc and the generator again and fails if the committed
+        # output differs, so editing the generator or the .proto without
+        # regenerating cannot reach main.
+        working-directory: examples/protobuf
+        run: |
+          zig build gen-proto
+          git diff --exit-code -- src
 
       - name: Compile benchmark
         # Built but not run: timings from a shared runner are too noisy to

@@ -43,11 +43,21 @@
             .url = "git+https://github.com/hendriknielaender/http2.zig#a2859f8c76a05c917e2a33162939721c45ca5d4f",
             .hash = "http2-0.0.6-j0BpmvXnCwAtH01A8TeEw555_8F_Zk_XqdhRHDewu4dy",
         },
+        // Only for `protoc-gen-zgrpc`, and lazy: it is fetched when a project
+        // builds this package with `-Dgenerator=true` and never otherwise, so
+        // the library itself still depends on no protobuf code. The tag is
+        // pinned for the reason in CLAUDE.md: master's build.zig is broken.
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf?ref=v5.0.0#1f6cb06156b3ff4f52f98bc14f829c0b8393a6fc",
+            .hash = "protobuf-5.0.0-0e82avKUKAAVwTWJzTIEZ14Fu0zC11_lElR8tE6H__y1",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "gen",
         "LICENSE",
         "README.md",
     },
