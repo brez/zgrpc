@@ -217,9 +217,15 @@ in docs/notes.md. The loopback numbers there were re-measured on a quiet
 machine (three runs; p50 is stable, p99/p999 are not).
 
 Next up:
-- Record the TSDB's real AZ layout and instance type. The 2026-10-19 run used
-  c7g.large and 1a-1a / 1a-1c (c7g.large is not offered in 1b); rerun with
-  `vpc/run.sh` if the TSDB differs. The TSDB consumer runs on AWS in us-east-1.
+- The TSDB is still in planning, so it has no AZ layout or instance type yet.
+  The 2026-10-19 run used c7g.large and 1a-1a / 1a-1c (c7g.large is not
+  offered in 1b); rerun `vpc/run.sh` once the TSDB has either. It will run on
+  AWS in us-east-1.
+- Revisit `reset_limit` once the TSDB's peak call rate is known. Resets arrive
+  at about the offered rate when callers time out in bulk, and the limit is per
+  connection: check that 2,000/s sits well above peak rate divided by pool size
+  (default 4), and raise it if not. Not `null`, which removes the only
+  protection against a client resetting in a loop.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.
 
 Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused
