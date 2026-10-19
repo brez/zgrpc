@@ -123,6 +123,37 @@ server's worst case. Credit is returned when a caller *consumes* bytes, not
 when they arrive — returning it on arrival, as an earlier version did, means
 there is no bound at all.
 
+## In the VPC (milestone 2)
+
+2026-10-19, AWS us-east-1, three c7g.large (2 vCPU, arm64, Amazon Linux 2023):
+one server in 1a, a client in 1a, a client in 1c. Built `ReleaseSafe`. Three
+repetitions of `vpc/run.sh`, 30s per row, no failed calls. Ranges across the
+repetitions; p99/p999 are from the fixed-rate rows, which do not under-sample
+stalls (the one-caller rows stop recording at 200,000 samples).
+
+```
+                               same-AZ (1a-1a)        cross-AZ (1c-1a)
+ICMP RTT avg / max             0.125 / 1.76 ms        0.56 / 2.84 ms
+1 caller, 1 KB   p50           58-61us                454-520us
+1 caller, 16 KB  p50           92-100us               519-539us
+500-5000/s, 8 callers  p50     222-238us              594-633us
+                       p99     275-295us              670-721us
+                       p999    311-509us              738-881us
+8 callers, flat out            ~53k/s, p50 107-113us  ~16.5k/s, p50 477-491us
+64 callers, flat out           93-98k/s, p999 7-9ms   88-89k/s, p999 6-8ms
+```
+
+Against a ~5ms budget the worst fixed-rate p999 is under 1ms, so there is no
+sign of a library tail problem. The 64-caller tail is two vCPUs saturated at
+~95k calls/s, not a load anyone will offer. Cross-AZ costs about 400us, nearly
+all network.
+
+Two cautions. The same-AZ RPC p50 sits below the ICMP average: a ping every
+50ms lets the core idle, so ICMP overstates the floor there and "p50 minus RTT"
+is not the RPC's cost. And this is one host pair at one time of day; noisy
+neighbours are not ruled out. Only 1a-1c was run, because c7g.large is not
+offered in 1b, and the TSDB's own AZ layout is not recorded.
+
 ## Concurrency
 
 Three levels, each on its own unit of concurrency:

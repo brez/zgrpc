@@ -109,9 +109,10 @@ consumer to validate the abstractions against:
 
 ## Open questions
 
-- Which HTTP/2 library wins the milestone-2 benchmark? Record the decision
-  and the numbers once made — this is the single most consequential choice
-  in the project.
+- ~~Which HTTP/2 library wins the milestone-2 benchmark?~~ Answered:
+  `http2.zig` stays. us-east-1 c7g.large numbers (2026-10-19) are in
+  docs/notes.md: worst fixed-rate p999 under 1ms against a ~5ms budget, no
+  tail problem traced to the library.
 - What does the public Zig API look like for defining a service and
   registering handlers? Sketch this early since the TSDB repo will be the
   first (and for a while, only) real consumer of it.
@@ -211,15 +212,15 @@ nothing about building *against* it — a consumer gets only what `paths` lists
 and runs build.zig as a dependency, not as root. Dev-only build steps sit
 behind `if (b.pkg_hash.len != 0) return;` for the same reason. CI runs it.
 
-Still open: the milestone-2 in-VPC benchmark numbers. The loopback numbers in
-docs/notes.md were re-measured on a quiet machine (three runs; p50 is stable,
-p99/p999 are not).
+Milestone 2 is measured: same-AZ and cross-AZ on c7g.large in us-east-1, numbers
+in docs/notes.md. The loopback numbers there were re-measured on a quiet
+machine (three runs; p50 is stable, p99/p999 are not).
 
 Next up:
-- Run `vpc/run.sh` between two machines on wired Ethernet, as a real-network
-  check ahead of the VPC run. Not the milestone-2 number. `vpc/README.md` is
-  cloud-neutral and covers this case; where the TSDB consumer runs is still
-  not recorded, and that decides which placement the milestone-2 run uses.
+- Record the TSDB's real AZ layout and instance type. The 2026-10-19 run used
+  c7g.large and 1a-1a / 1a-1c (c7g.large is not offered in 1b); rerun with
+  `vpc/run.sh` if the TSDB differs. The TSDB consumer runs on AWS in us-east-1.
+- The wired-Ethernet two-host check is no longer needed ahead of anything.
 
 Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused
 before their length sizes a buffer, a header block is capped at 64KB both
@@ -282,4 +283,4 @@ during an outage; the defaults are far above ordinary traffic and `null` turns
 it off. The client has no such limit — nothing a server does is worth one yet.
 
 Every item the source-reading pass found is now done. What is left is the
-milestone-2 in-VPC numbers and the "Next up" item above.
+"Next up" item above.
