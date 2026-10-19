@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zgrpc_dep = b.dependency("zgrpc", .{ .target = target, .optimize = optimize });
+    const zgrpc_dep = b.dependency("zgrpc", .{ .target = target, .optimize = optimize, .generator = true });
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
@@ -25,16 +25,26 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the protobuf example");
     run_step.dependOn(&b.addRunArtifact(exe).step);
 
-    // Regenerates src/helloworld.pb.zig, which is committed so that building
+    // Regenerates src/helloworld.pb.zig (the messages) and
+    // src/helloworld.zgrpc.zig (the stubs), both committed so that building
     // this example needs neither protoc nor a network. Run it after editing
     // the .proto.
-    const gen_step = b.step("gen-proto", "Regenerate Zig types from proto/");
-    gen_step.dependOn(&protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+    const proto_options: protobuf.RunProtocStep.Options = .{
         .destination_directory = b.path("src"),
         .source_files = &.{b.path("proto/helloworld.proto")},
         // Must contain the .proto files: protoc rejects any path it cannot see
         // below one of these, which the snippet in zig-protobuf's own README
         // gets wrong for protos in a subdirectory.
         .include_directories = &.{b.path("proto")},
-    }).step);
+    };
+    const gen_step = b.step("gen-proto", "Regenerate message types and stubs from proto/");
+    gen_step.dependOn(&protobuf.RunProtocStep.create(protobuf_dep.builder, target, proto_options).step);
+    // A second protoc run with zgrpc's plugin in place of zig-protobuf's: the
+    // step only passes protoc a plugin and an output directory, so it serves
+    // any generator that writes its files there.
+    gen_step.dependOn(&protobuf.RunProtocStep.createWithGenerator(
+        protobuf_dep.builder,
+        zgrpc_dep.artifact("protoc-gen-zgrpc"),
+        proto_options,
+    ).step);
 }

@@ -1,4 +1,5 @@
-//! zgrpc with protobuf messages, end to end over a real socket.
+//! zgrpc with protobuf messages and generated stubs, end to end over a real
+//! socket.
 //!
 //! A standalone project rather than part of the main build, and that is the
 //! point: zgrpc has no protobuf dependency, so anything demonstrating protobuf
@@ -6,71 +7,75 @@
 //! than merely claimed — see the repository README, "Protobuf".
 //!
 //!     zig build run        the round trip below
-//!     zig build gen-proto  regenerate src/helloworld.pb.zig from proto/
+//!     zig build gen-proto  regenerate src/helloworld.*.zig from proto/
 
 const std = @import("std");
 const zgrpc = @import("zgrpc");
 const pb = @import("helloworld.pb.zig");
+const stubs = @import("helloworld.zgrpc.zig");
 
-/// Written out by hand to match proto/helloworld.proto. Nothing generates or
-/// checks it, which is the gap described in the README.
-const say_hello = "/helloworld.Greeter/SayHello";
+/// The server side of `service Greeter`: one function per method, typed. The
+/// stub decodes the request, encodes the reply, and answers a request that
+/// does not decode with INVALID_ARGUMENT, so none of that is written here.
+/// Anything allocated from `ctx.allocator` is freed when the call ends.
+const Greeter = struct {
+    pub fn sayHello(ctx: *zgrpc.CallContext, request: pb.HelloRequest) anyerror!pb.HelloReply {
+        if (request.name.len == 0) return ctx.fail(.invalid_argument, "name is required");
+        return .{ .message = try std.fmt.allocPrint(ctx.allocator, "hello {s}", .{request.name}) };
+    }
 
-/// zgrpc hands over the serialized message and wants one back, so a handler is
-/// decode, work, encode. Everything comes from `ctx.allocator`, an arena freed
-/// when the call ends, so none of it needs cleanup.
-fn sayHello(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
-    var reader = std.Io.Reader.fixed(request);
-    const req = try pb.HelloRequest.decode(&reader, ctx.allocator);
-
-    if (req.name.len == 0) return ctx.fail(.invalid_argument, "name is required");
-
-    const reply: pb.HelloReply = .{
-        .message = try std.fmt.allocPrint(ctx.allocator, "hello {s}", .{req.name}),
-    };
-
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    try reply.encode(&out.writer, ctx.allocator);
-    return out.written();
-}
-
-const methods = [_]zgrpc.Method{
-    zgrpc.Method.unary(say_hello, sayHello),
+    /// Streaming: each `send` goes out as it is made, so a long result never
+    /// has to exist all at once. `try` it, and the handler stops when the
+    /// client cancels or the deadline passes.
+    pub fn sayHelloTimes(
+        ctx: *zgrpc.CallContext,
+        request: pb.HelloTimesRequest,
+        sender: *zgrpc.typed.Sender(pb.HelloReply),
+    ) anyerror!void {
+        for (0..request.times) |i| {
+            const message = try std.fmt.allocPrint(ctx.allocator, "hello {s} #{d}", .{ request.name, i + 1 });
+            try sender.send(.{ .message = message });
+        }
+    }
 };
+
+const methods = stubs.Greeter.Methods(Greeter).all;
 
 fn serve(server: *zgrpc.Server) void {
     server.serve() catch {};
 }
 
-/// The client half: encode, call, decode.
+/// The streaming client half: messages arrive one at a time, each valid until
+/// the next call to `next`.
+fn greetTimes(
+    allocator: std.mem.Allocator,
+    greeter: stubs.Greeter.Client,
+    name: []const u8,
+    times: u32,
+) !void {
+    var stream = try greeter.sayHelloTimes(allocator, .{ .name = name, .times = times }, .{});
+    defer stream.deinit();
+
+    while (try stream.next()) |reply| std.debug.print("{s: <7} -> {s}\n", .{ name, reply.message });
+    if (!stream.finalStatus().isOk()) std.debug.print("{s: <7} -> {t}\n", .{ name, stream.finalStatus().code });
+}
+
+/// The client half: a typed call, a typed reply.
 fn greet(
     allocator: std.mem.Allocator,
-    pool: *zgrpc.Pool,
+    greeter: stubs.Greeter.Client,
     name: []const u8,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var request: std.Io.Writer.Allocating = .init(arena.allocator());
-    try (pb.HelloRequest{ .name = name }).encode(&request.writer, arena.allocator());
-
-    var response = try pool.call(say_hello, request.written(), .{
+    var reply = try greeter.sayHello(allocator, .{ .name = name }, .{
         .deadline_ns = 2 * std.time.ns_per_s,
     });
-    defer response.deinit();
+    defer reply.deinit();
 
-    if (!response.call_status.isOk()) {
-        std.debug.print("{s: <7} -> {t}: {s}\n", .{
-            name,
-            response.call_status.code,
-            response.call_status.message,
-        });
-        return;
+    if (reply.message) |message| {
+        std.debug.print("{s: <7} -> {s}\n", .{ name, message.message });
+    } else {
+        std.debug.print("{s: <7} -> {t}: {s}\n", .{ name, reply.status.code, reply.status.message });
     }
-
-    var reader = std.Io.Reader.fixed(response.message);
-    const reply = try pb.HelloReply.decode(&reader, arena.allocator());
-    std.debug.print("{s: <7} -> {s}\n", .{ name, reply.message });
 }
 
 pub fn main() !void {
@@ -101,9 +106,11 @@ pub fn main() !void {
     const pool = try zgrpc.Pool.init(allocator, io, bound, authority, .{});
     defer pool.deinit();
 
-    try greet(allocator, pool, "zig");
-    try greet(allocator, pool, "world");
+    const greeter = stubs.Greeter.Client.init(pool);
+    try greet(allocator, greeter, "zig");
+    try greet(allocator, greeter, "world");
     // An empty name, so the handler's `ctx.fail` comes back as a gRPC status
     // rather than as a transport error.
-    try greet(allocator, pool, "");
+    try greet(allocator, greeter, "");
+    try greetTimes(allocator, greeter, "stream", 3);
 }

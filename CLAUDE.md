@@ -36,6 +36,10 @@ consumer to validate the abstractions against:
   discovery. These are real gRPC features but nobody needs them yet.
 - No TLS/ALPN until a concrete use case requires leaving the VPC.
 
+One deliberate exception: on 2026-10-19 the stated goal became a general-purpose
+library, not one shaped around harvezter, so stubs were built ahead of a second
+consumer. The rule above still governs everything else on that list.
+
 ## Architecture (layers, bottom to top)
 
 1. **TCP/h2c** — plaintext transport.
@@ -63,9 +67,8 @@ consumer to validate the abstractions against:
      `service` — function pointers plus `package` and `service_name`
      constants — and zig-protobuf's own README says it is "service interfaces
      only ... does not include a gRPC transport layer". The signatures are not
-     zgrpc's handler shape, so nothing plugs in: method paths and their types
-     are written by hand. A protoc plugin emitting zgrpc handlers is the thing
-     that would fix this.
+     zgrpc's handler shape, so nothing plugs in. A protoc plugin emitting zgrpc
+     handlers was the fix, and `gen/` is it (see "Decisions made", Stubs).
 
 ## Dependency versions (confirmed working)
 
@@ -132,8 +135,12 @@ consumer to validate the abstractions against:
   against `vpc_server`; see docs/notes.md)
 - `./interop/run.sh` — grpc-go interop suite; requires Go
 - `./packaging/verify.sh` — fetch and use zgrpc as a published dependency
-- `cd examples/protobuf && zig build run` — protobuf end to end; a standalone
-  project so that zgrpc itself keeps having no protobuf dependency
+- `zig build test-gen -Dgenerator=true` — the stub generator's tests (fetches
+  zig-protobuf; the option is what makes the dependency non-lazy)
+- `cd examples/protobuf && zig build run` — protobuf and generated stubs end to
+  end; a standalone project so that zgrpc itself keeps having no protobuf
+  dependency. `zig build gen-proto` there regenerates `src/helloworld.*.zig`
+  (CI fails if the committed copies are stale)
 
 ## Decisions made
 
@@ -152,11 +159,40 @@ Note the dependency's own `zig build` fails on its BoringSSL TLS targets; the
 **Public API shape**: handlers take and return `[]const u8`, with a
 `CallContext` carrying the per-call arena, io, path, deadline and settable
 status. Protobuf codegen sits above the transport rather than inside it — and
-as of v0.1.0 zgrpc has **no protobuf dependency at all**. It was wired into
-every module in build.zig and imported nowhere; a consumer that wants generated
-types depends on `Arwalk/zig-protobuf` directly rather than inheriting our pin.
-The pinning notes above still apply to that consumer, which is why they stay
-here.
+the library module has **no protobuf dependency**. (v0.1.0 had one wired into
+every module and imported nowhere, which is why it was removed.) A consumer
+that wants generated types depends on `Arwalk/zig-protobuf` directly rather
+than inheriting our pin; the one exception is the opt-in generator below. The
+pinning notes above still apply, which is why they stay here.
+
+**Stubs (`gen/`, `src/typed.zig`)**: unary and server-streaming only, matching
+what the library speaks. Three decisions, each forced by something:
+- *The typed layer is in zgrpc, the generator is not.* `zgrpc.typed` is
+  duck-typed over `encode(writer, allocator)` / `decode(reader, allocator)` —
+  zig-protobuf's shape, imported from nowhere — so it is testable with a fake
+  message type and the library still needs no protobuf. The generated files
+  are then only names, which is why they are small. A message that does not
+  decode is INVALID_ARGUMENT, not INTERNAL.
+- *The generator ships inside this package behind `-Dgenerator=true`, with
+  zig-protobuf as a **lazy** dependency.* A plugin must parse protoc's
+  descriptors, so it needs zig-protobuf; and Zig cannot depend on a
+  subdirectory of a repo, so a separate `gen/` package could not be fetched.
+  Lazy means a project that does not pass the option never fetches it —
+  checked against an empty package cache, not assumed. `gen/google/*.pb.zig`
+  are zig-protobuf's own bootstrapped descriptor types, copied because it does
+  not export them (`gen/NOTICE`).
+- *Handlers needed a context pointer.* They are bare function pointers, so a
+  typed handler could reach no state but globals. `Server.Options.user_data`
+  surfaces as `ctx.userData(T)`; additive, null by default.
+
+Output is one `<package>.zgrpc.zig` per package, next to zig-protobuf's
+`<package>.pb.zig`, because that is how its files are laid out. It runs as a
+second protoc pass through `RunProtocStep.createWithGenerator`, which only
+hands protoc a plugin and an output directory. A client- or
+bidirectionally-streaming rpc fails generation: a stub missing a method is a
+worse surprise than no stub. Doc comments and options are not carried over.
+Not checked against grpc-go: the typed layer changes only what turns bytes
+into messages, and interop already covers the bytes.
 
 **Concurrency model**: a unit of concurrency per connection, per connection a
 reader task that owns the read side, and per stream a task running the call.
@@ -226,6 +262,10 @@ Next up:
   connection: check that 2,000/s sits well above peak rate divided by pool size
   (default 4), and raise it if not. Not `null`, which removes the only
   protection against a client resetting in a loop.
+- Release the stubs as v0.3.0 (additive API: `typed`, `user_data`, the
+  generator), bumping `build.zig.zon` and the README's fetch line as v0.2.1 did.
+- Then let harvezter use them: bump its pin, and adopt the generated client and
+  `Methods(Impl)` once it has a `.proto` of its own.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.
 
 Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused

@@ -21,8 +21,8 @@ exe.root_module.addImport("zgrpc", zgrpc_dep.module("zgrpc"));
 
 The only dependency is `hendriknielaender/http2.zig`, for its frame codec and
 HPACK. There is deliberately no protobuf dependency: this library moves
-`[]const u8` and codegen sits above it, so depend on `Arwalk/zig-protobuf`
-yourself rather than inheriting a pin from here.
+`[]const u8`, and the optional stub generator ([Protobuf](#protobuf)) fetches
+`Arwalk/zig-protobuf` only if you ask for it.
 
 ## Server
 
@@ -92,64 +92,76 @@ connection. `zgrpc.Client` is the single connection underneath, if you want it
 directly.
 
 Handlers take and return **bytes**, not generated types, so the same shape
-works for any codec.
+works for any codec. Typed handlers are [generated on top](#protobuf).
 
 ## Protobuf
 
-zgrpc moves `[]const u8`, and those bytes are the serialized message — so a
-`.proto` fits by generating Zig types with `protoc`, decoding at the top of the
-handler and encoding at the bottom. Add
-[zig-protobuf](https://github.com/Arwalk/zig-protobuf) yourself; codegen is a
-build step, and it downloads `protoc` for you.
-
-[`examples/protobuf/`](examples/protobuf) is all of this working: a `.proto`,
-the generated types, a server and a client. It is a standalone project because
-zgrpc has no protobuf dependency and the example needs one — which is also what
-keeps that claim honest. `cd examples/protobuf && zig build run`.
+zgrpc moves `[]const u8`, and those bytes are the serialized message, so a
+`.proto` fits with types from `protoc` and code that decodes and encodes at the
+edges. A protoc plugin, `protoc-gen-zgrpc`, writes that code for you: from each
+`service` it generates the method paths, a typed client, and the handler table
+a server takes. It is opt-in, because it needs
+[zig-protobuf](https://github.com/Arwalk/zig-protobuf); leave it off and nothing
+protobuf is ever fetched.
 
 ```zig
 // build.zig
-const protobuf = @import("protobuf");
+const zgrpc_dep = b.dependency("zgrpc", .{ .target = target, .optimize = optimize, .generator = true });
+const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
 
-const gen = b.step("gen-proto", "generate Zig types from .proto");
-gen.dependOn(&protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
-    .destination_directory = b.path("src/proto"),
+const options: protobuf.RunProtocStep.Options = .{
+    .destination_directory = b.path("src"),
     .source_files = &.{b.path("proto/helloworld.proto")},
-    // Must contain the .proto files; protoc rejects paths it cannot see below
-    // one of these.
     .include_directories = &.{b.path("proto")},
-}).step);
+};
+const gen = b.step("gen-proto", "generate message types and stubs");
+gen.dependOn(&protobuf.RunProtocStep.create(protobuf_dep.builder, target, options).step); // helloworld.pb.zig
+gen.dependOn(&protobuf.RunProtocStep.createWithGenerator( // helloworld.zgrpc.zig
+    protobuf_dep.builder,
+    zgrpc_dep.artifact("protoc-gen-zgrpc"),
+    options,
+).step);
 ```
 
 ```zig
-const pb = @import("proto/helloworld.pb.zig");
+const pb = @import("helloworld.pb.zig");
+const stubs = @import("helloworld.zgrpc.zig");
 
-fn sayHello(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
-    var reader = std.Io.Reader.fixed(request);
-    const req = try pb.HelloRequest.decode(&reader, ctx.allocator);
+// Server: one typed function per rpc. The stub decodes the request (a message
+// that does not decode is INVALID_ARGUMENT) and encodes the reply.
+const Greeter = struct {
+    pub fn sayHello(ctx: *zgrpc.CallContext, request: pb.HelloRequest) anyerror!pb.HelloReply {
+        return .{ .message = try std.fmt.allocPrint(ctx.allocator, "hello {s}", .{request.name}) };
+    }
+    // A server-streaming rpc takes `sender: *zgrpc.typed.Sender(pb.HelloReply)`
+    // and calls `try sender.send(reply)` per message.
+};
+const methods = stubs.Greeter.Methods(Greeter).all; // `++` several services together
+var server = try zgrpc.Server.listen(allocator, io, address, &methods, .{ .user_data = &state });
+// Handlers reach `state` with ctx.userData(State): they are plain functions.
 
-    const reply: pb.HelloReply = .{
-        .message = try std.fmt.allocPrint(ctx.allocator, "hello {s}", .{req.name}),
-    };
-
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    try reply.encode(&out.writer, ctx.allocator);
-    return out.written();
-}
+// Client: typed calls over a Pool.
+const greeter = stubs.Greeter.Client.init(pool);
+var reply = try greeter.sayHello(allocator, .{ .name = "zig" }, .{});
+defer reply.deinit();
+if (reply.message) |m| { /* m.message */ } else { /* reply.status.code */ }
 ```
 
-Both allocate from `ctx.allocator`, so neither needs cleanup — the arena goes
-when the call does. Clients are the mirror image: encode the request, pass the
-bytes to `call`, decode `response.message`.
+A server-streaming call returns a receiver: `while (try stream.next()) |m|`, then
+`stream.finalStatus()`. Unary and server-streaming rpcs only; a client- or
+bidirectionally-streaming one fails generation rather than vanishing from the
+stub. A `.proto` needs a `package`, because zig-protobuf writes one file per
+package and the stubs import it.
 
-**There is no stub generation.** You write the `/package.Service/Method` path
-yourself and pair it with the right request and response types by hand; nothing
-checks that you got it right. zig-protobuf does emit a vtable type per
-`service` — with `package` and `service_name` constants you can build the path
-from — but it is transport-agnostic by design (its README: "service interfaces
-only ... does not include a gRPC transport layer") and its handler signatures
-are not zgrpc's, so it is not something to plug in. Closing this properly means
-a protoc plugin that emits zgrpc handlers, which does not exist yet.
+[`examples/protobuf/`](examples/protobuf) runs all of this: `zig build run`, and
+`zig build gen-proto` regenerates both files. It is a standalone project because
+the generator needs zig-protobuf and zgrpc itself must not.
+
+The calls underneath are `zgrpc.typed`, which works with any message type that
+has `encode(writer, allocator)` and `decode(reader, allocator)` in
+zig-protobuf's shape, so the plugin is a convenience and not a requirement.
+Without it you decode and encode by hand around the byte API, as in the
+Server and Client sections above.
 
 ## Operating a server
 
@@ -179,8 +191,9 @@ a protoc plugin that emits zgrpc handlers, which does not exist yet.
   headers or trailers beyond the status, and `-bin` names are refused.
 - **No retries, load balancing, interceptors or name resolution.** A pool is
   several connections to *one* peer.
-- **No generated service stubs.** Message types come from protoc; method paths
-  and their types are hand-written. See [Protobuf](#protobuf).
+- **Stubs are unary and server-streaming only**, and carry nothing from the
+  .proto but names and types: no doc comments, options or deprecation. See
+  [Protobuf](#protobuf).
 - **Deadlines bound waiting, not working.** Every wait a call makes is bounded,
   but a handler burning CPU cannot be preempted, and neither connecting nor a
   socket write to a peer that has stopped draining TCP is covered.
