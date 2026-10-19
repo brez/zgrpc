@@ -11,7 +11,7 @@ connection pool, and enforced deadlines. Zig 0.16.0.
 ## Installing
 
 ```
-zig fetch --save "git+https://github.com/brez/zgrpc#v0.2.0"
+zig fetch --save "git+https://github.com/brez/zgrpc#v0.2.1"
 ```
 
 ```zig
@@ -211,7 +211,7 @@ the size they are, and the bugs interop and benchmarking found.
 
 ## Versioning
 
-**v0.2.0**, semantic, with 0.x meaning the Zig API may still move — with one
+**v0.2.1**, semantic, with 0.x meaning the Zig API may still move — with one
 consumer, an awkward API is worth breaking rather than living with. The wire
 behaviour is the stable part, and the interop suite is what a bump has to keep
 passing.
