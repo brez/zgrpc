@@ -262,10 +262,8 @@ Next up:
   connection: check that 2,000/s sits well above peak rate divided by pool size
   (default 4), and raise it if not. Not `null`, which removes the only
   protection against a client resetting in a loop.
-- Release the stubs as v0.3.0 (additive API: `typed`, `user_data`, the
-  generator), bumping `build.zig.zon` and the README's fetch line as v0.2.1 did.
-- Then let harvezter use them: bump its pin, and adopt the generated client and
-  `Methods(Impl)` once it has a `.proto` of its own.
+- Let harvezter use the stubs (released in v0.3.0): bump its pin, and adopt the
+  generated client and `Methods(Impl)` once it has a `.proto` of its own.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.
 
 Inbound size limits are done: frames over `SETTINGS_MAX_FRAME_SIZE` are refused
