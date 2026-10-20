@@ -12,7 +12,7 @@ Zig 0.16.0.
 ## Installing
 
 ```
-zig fetch --save "git+https://github.com/brez/zgrpc#v0.3.0"
+zig fetch --save "git+https://github.com/brez/zgrpc#v0.4.0"
 ```
 
 ```zig
@@ -231,7 +231,7 @@ budget).
 
 ## Versioning
 
-**v0.3.0**, semantic, with 0.x meaning the Zig API may still move — with one
+**v0.4.0**, semantic, with 0.x meaning the Zig API may still move — with one
 consumer so far, an awkward API is worth breaking rather than living with. The wire
 behaviour is the stable part, and the interop suite is what a bump has to keep
 passing.
