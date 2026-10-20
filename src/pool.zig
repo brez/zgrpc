@@ -45,6 +45,78 @@ pub const Options = struct {
     size: usize = 4,
     /// Applied to every connection the pool opens.
     client: client_mod.Options = .{},
+    /// Run around every call made through the pool, first one outermost.
+    /// Borrowed: the slice and each `context` must outlive the pool. Empty
+    /// costs a call nothing.
+    interceptors: []const Interceptor = &.{},
+};
+
+/// Wraps every call made through a `Pool`: attaching credentials, logging,
+/// metrics, tracing. Works with bytes, like the pool itself, so one
+/// interceptor serves every service; typed stubs go through it too.
+///
+/// Set whichever of `unary` and `server_stream` apply; a null one is skipped.
+/// `Options.interceptors[0]` is outermost.
+pub const Interceptor = struct {
+    /// Handed back to the function on every call. The pool never touches it.
+    context: ?*anyopaque = null,
+    unary: ?UnaryInterceptor = null,
+    server_stream: ?StreamInterceptor = null,
+};
+
+/// Call `next.call(request, options)` to continue. `options` is passed on
+/// rather than shared so an interceptor can change it: add `metadata`, tighten
+/// the deadline. Whatever it points at is borrowed for the call, so keep it
+/// alive until `next` returns. Returning without calling `next` answers the
+/// call from here, which needs a `Response` the interceptor builds itself.
+///
+/// What the interceptor sees back is the call's outcome: a `Response` whose
+/// `call_status` may be an error status, or a transport error such as
+/// `error.DeadlineExceeded`.
+pub const UnaryInterceptor = *const fn (
+    context: ?*anyopaque,
+    path: []const u8,
+    request: []const u8,
+    options: client_mod.CallOptions,
+    next: UnaryNext,
+) anyerror!Response;
+
+/// As `UnaryInterceptor`, around starting a server-streaming call. It sees the
+/// call begin, not each message: the stream it returns is read by the caller.
+pub const StreamInterceptor = *const fn (
+    context: ?*anyopaque,
+    path: []const u8,
+    request: []const u8,
+    options: client_mod.CallOptions,
+    next: StreamNext,
+) anyerror!PooledStream;
+
+pub const UnaryNext = struct {
+    pool: *Pool,
+    path: []const u8,
+    remaining: []const Interceptor,
+
+    pub fn call(self: UnaryNext, request: []const u8, options: client_mod.CallOptions) anyerror!Response {
+        if (self.remaining.len == 0) return self.pool.callOnConnection(self.path, request, options);
+        const rest: UnaryNext = .{ .pool = self.pool, .path = self.path, .remaining = self.remaining[1..] };
+        const interceptor = self.remaining[0];
+        const run = interceptor.unary orelse return rest.call(request, options);
+        return run(interceptor.context, self.path, request, options, rest);
+    }
+};
+
+pub const StreamNext = struct {
+    pool: *Pool,
+    path: []const u8,
+    remaining: []const Interceptor,
+
+    pub fn call(self: StreamNext, request: []const u8, options: client_mod.CallOptions) anyerror!PooledStream {
+        if (self.remaining.len == 0) return self.pool.streamOnConnection(self.path, request, options);
+        const rest: StreamNext = .{ .pool = self.pool, .path = self.path, .remaining = self.remaining[1..] };
+        const interceptor = self.remaining[0];
+        const run = interceptor.server_stream orelse return rest.call(request, options);
+        return run(interceptor.context, self.path, request, options, rest);
+    }
 };
 
 /// One pooled connection, and the calls using it.
@@ -171,8 +243,19 @@ pub const Pool = struct {
         self.allocator.destroy(self);
     }
 
-    /// Performs one unary call on some connection of the pool.
+    /// Performs one unary call on some connection of the pool, through
+    /// `Options.interceptors`.
     pub fn call(
+        self: *Pool,
+        path: []const u8,
+        request: []const u8,
+        call_options: client_mod.CallOptions,
+    ) !Response {
+        const next: UnaryNext = .{ .pool = self, .path = path, .remaining = self.options.interceptors };
+        return next.call(request, call_options);
+    }
+
+    fn callOnConnection(
         self: *Pool,
         path: []const u8,
         request: []const u8,
@@ -183,9 +266,19 @@ pub const Pool = struct {
         return entry.client.call(path, request, call_options);
     }
 
-    /// Starts a server-streaming call. The connection is held until the
-    /// returned stream is deinited.
+    /// Starts a server-streaming call, through `Options.interceptors`. The
+    /// connection is held until the returned stream is deinited.
     pub fn callServerStream(
+        self: *Pool,
+        path: []const u8,
+        request: []const u8,
+        call_options: client_mod.CallOptions,
+    ) !PooledStream {
+        const next: StreamNext = .{ .pool = self, .path = path, .remaining = self.options.interceptors };
+        return next.call(request, call_options);
+    }
+
+    fn streamOnConnection(
         self: *Pool,
         path: []const u8,
         request: []const u8,

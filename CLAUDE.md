@@ -32,13 +32,16 @@ consumer. Specifically avoid over-building before there's a second
 consumer to validate the abstractions against:
 
 - Unary RPCs first. Server streaming once unary is proven and benchmarked.
-- No interceptors, no retries, no client-side load balancing, no service
-  discovery. These are real gRPC features but nobody needs them yet.
+- No retries, no client-side load balancing, no service discovery. These are
+  real gRPC features but nobody needs them yet. (Interceptors were on this
+  list and are built; see the exception below.)
 - No TLS/ALPN until a concrete use case requires leaving the VPC.
 
 One deliberate exception: on 2026-10-19 the stated goal became a general-purpose
-library, not one shaped around harvezter, so stubs were built ahead of a second
-consumer. The rule above still governs everything else on that list.
+library, not one shaped around harvezter, so stubs and then interceptors were
+built ahead of a second consumer, and retries, name resolution and load
+balancing are planned, in that order (see "Next up"). The rule above still
+governs everything else on that list.
 
 ## Architecture (layers, bottom to top)
 
@@ -195,6 +198,21 @@ doc comment (client methods, service); options and deprecation are not carried.
 Not checked against grpc-go: the typed layer changes only what turns bytes
 into messages, and interop already covers the bytes.
 
+**Interceptors** (`server.Interceptor`, `pool.Interceptor`): a function pointer
+plus a context pointer, since Zig has no closures, chained by recursive `Next`
+structs over a borrowed slice, so a call allocates nothing and an empty list
+costs a slice-length check. Bytes-level on purpose, for the same reason
+handlers are: one interceptor serves every service, and the typed stubs sit
+below them. Two non-obvious limits, both documented: a streaming interceptor
+sees the call begin and end, not each message (that needs a wrapping stream
+type, which nobody has asked for), and on the server they do not run for an
+unknown method or a request refused before a handler (UNIMPLEMENTED is
+answered first), which an auth interceptor's author should know. Client
+interceptors live on `Pool`, not `Client`: the pool is the top-level call API,
+and the later `Channel` will take the same chain. Interceptor functions return
+`anyerror`, which widens `Pool.call`'s error set; callers already needed an
+`else` for transport errors.
+
 **Concurrency model**: a unit of concurrency per connection, per connection a
 reader task that owns the read side, and per stream a task running the call.
 Writers take a separate lock from connection state and the two are never held
@@ -264,6 +282,18 @@ Next up:
   (above peak call rate divided by pool size); raise it for a busier pool, not
   `null`, which removes the only protection against a client resetting in a
   loop.
+- Retries, next. Decided: retry a call the server provably never started
+  (refused stream, GOAWAY past the last id) always; retry UNAVAILABLE and the
+  like only when the caller marks the call idempotent, because a retried write
+  that did reach the server can run twice. Per-call policy with attempts,
+  exponential backoff with jitter, bounded by the call's deadline; streams only
+  before the first message. Lives in the pool, not as an interceptor, since it
+  needs to know about connections.
+- Then a `Channel`: a resolver (DNS or a static list, re-resolved on a
+  schedule) feeding one `Pool` per address, a picker over them, a down-mark with
+  backoff for a failing address, and retries gaining the option of another
+  peer. `zgrpc.typed` already needs only `call`/`callServerStream`, so stubs
+  would take a `Channel` as readily as a `Pool`.
 - Let harvezter use the stubs (released in v0.3.0): bump its pin, and adopt the
   generated client and `Methods(Impl)` once it has a `.proto` of its own.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.
@@ -312,8 +342,8 @@ still unsupported, and a client receiving a compressed message still gets
 `error.CompressionNotSupported`. Unexpected handler errors are now logged
 server-side with the method path; callers still see `@errorName(err)` as the
 INTERNAL message, which is useful in a trusted VPC and worth revisiting before
-anything leaves it. Metrics and logging hooks are not built: they are
-interceptor-shaped, which the scope rules exclude, and no consumer has asked.
+anything leaves it. No metrics or logging hooks ship: they are interceptors
+now, so a consumer writes the one it wants (the README shows the shape).
 
 Rapid reset is measured and handled (numbers in docs/notes.md, tool is
 `zig build flood`). Live streams were already bounded at 128 because a reset

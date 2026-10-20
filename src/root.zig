@@ -29,6 +29,7 @@ pub const Status = status.Status;
 pub const Client = client.Client;
 pub const Pool = pool.Pool;
 pub const PooledStream = pool.PooledStream;
+pub const ClientInterceptor = pool.Interceptor;
 pub const Server = server.Server;
 pub const Method = server.Method;
 pub const ServerStream = server.ServerStream;
@@ -36,6 +37,7 @@ pub const StreamHandler = server.StreamHandler;
 pub const ResponseStream = client.ResponseStream;
 pub const CallContext = server.CallContext;
 pub const MethodHandler = server.MethodHandler;
+pub const ServerInterceptor = server.Interceptor;
 pub const Reply = typed.Reply;
 
 test {

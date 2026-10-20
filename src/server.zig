@@ -129,6 +129,81 @@ pub const StreamHandler = *const fn (
     stream: *ServerStream,
 ) anyerror!void;
 
+/// Wraps every call the server handles: authentication, logging, metrics,
+/// tracing, rate limiting. Work with bytes and the `CallContext`, as handlers
+/// do, so one interceptor serves every service whatever its message types.
+///
+/// Set whichever of `unary` and `server_stream` apply; a null one is skipped,
+/// so an interceptor that only cares about unary calls costs a streaming call
+/// nothing. `Options.interceptors[0]` is outermost.
+///
+/// An interceptor runs only for a method that exists and a request that got as
+/// far as a handler: an unknown path, an unsupported encoding or a malformed
+/// frame is answered before any of them.
+pub const Interceptor = struct {
+    /// Handed back to the function on every call. The server never touches it.
+    context: ?*anyopaque = null,
+    unary: ?UnaryInterceptor = null,
+    server_stream: ?StreamInterceptor = null,
+};
+
+/// Call `next.call(ctx, request)` to continue, or return without it to answer
+/// the call yourself. Fail it with `ctx.fail`, as a handler would. After
+/// `next` returns, `ctx.status` and the response (or error) are visible, which
+/// is how an interceptor counts statuses or times a call.
+///
+/// Called from many tasks at once, so `context` must be safe for that.
+pub const UnaryInterceptor = *const fn (
+    context: ?*anyopaque,
+    ctx: *CallContext,
+    request: []const u8,
+    next: UnaryNext,
+) anyerror![]const u8;
+
+/// As `UnaryInterceptor`, around a server-streaming handler. It sees the call
+/// begin and end, not each message: `stream` is the same handle the handler
+/// gets, so sending through it from here is allowed and visible to the client.
+pub const StreamInterceptor = *const fn (
+    context: ?*anyopaque,
+    ctx: *CallContext,
+    request: []const u8,
+    stream: *ServerStream,
+    next: StreamNext,
+) anyerror!void;
+
+/// The rest of the chain: the interceptors not yet run, then the handler.
+pub const UnaryNext = struct {
+    remaining: []const Interceptor,
+    handler: MethodHandler,
+
+    pub fn call(self: UnaryNext, ctx: *CallContext, request: []const u8) anyerror![]const u8 {
+        const rest: UnaryNext = .{
+            .remaining = if (self.remaining.len > 0) self.remaining[1..] else self.remaining,
+            .handler = self.handler,
+        };
+        if (self.remaining.len == 0) return self.handler(ctx, request);
+        const interceptor = self.remaining[0];
+        const run = interceptor.unary orelse return rest.call(ctx, request);
+        return run(interceptor.context, ctx, request, rest);
+    }
+};
+
+pub const StreamNext = struct {
+    remaining: []const Interceptor,
+    handler: StreamHandler,
+
+    pub fn call(self: StreamNext, ctx: *CallContext, request: []const u8, stream: *ServerStream) anyerror!void {
+        const rest: StreamNext = .{
+            .remaining = if (self.remaining.len > 0) self.remaining[1..] else self.remaining,
+            .handler = self.handler,
+        };
+        if (self.remaining.len == 0) return self.handler(ctx, request, stream);
+        const interceptor = self.remaining[0];
+        const run = interceptor.server_stream orelse return rest.call(ctx, request, stream);
+        return run(interceptor.context, ctx, request, stream, rest);
+    }
+};
+
 pub const Handler = union(enum) {
     unary: MethodHandler,
     server_stream: StreamHandler,
@@ -235,6 +310,9 @@ pub const Options = struct {
     /// Handed to every handler as `ctx.user_data`. The server never touches
     /// it, and it must outlive the server.
     user_data: ?*anyopaque = null,
+    /// Run around every call, first one outermost. Borrowed: the slice and
+    /// each `context` must outlive the server. Empty costs a call nothing.
+    interceptors: []const Interceptor = &.{},
 };
 
 pub const Server = struct {
@@ -594,7 +672,8 @@ pub const Server = struct {
 
         switch (handler) {
             .unary => |call| {
-                const response = call(&ctx, request_bytes) catch |err| {
+                const next: UnaryNext = .{ .remaining = self.options.interceptors, .handler = call };
+                const response = next.call(&ctx, request_bytes) catch |err| {
                     try self.respondStatusOnly(conn, stream.id, failureStatus(&ctx, err));
                     return;
                 };
@@ -623,7 +702,8 @@ pub const Server = struct {
                 };
                 defer out.deinit();
 
-                if (call(&ctx, request_bytes, &out)) |_| {
+                const next: StreamNext = .{ .remaining = self.options.interceptors, .handler = call };
+                if (next.call(&ctx, request_bytes, &out)) |_| {
                     const final = if (ctx.expired() and ctx.status.isOk()) deadline_status else ctx.status;
                     try self.finishStream(conn, stream, &out, final);
                 } else |err| {

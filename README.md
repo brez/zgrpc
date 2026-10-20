@@ -164,6 +164,41 @@ zig-protobuf's shape, so the plugin is a convenience and not a requirement.
 Without it you decode and encode by hand around the byte API, as in the
 Server and Client sections above.
 
+## Interceptors
+
+An interceptor wraps every call, on either side: authentication, logging,
+metrics, tracing. It works with bytes and the `CallContext`, so one serves every
+service, and typed stubs go through it too. Call `next` to continue, or return
+without it to answer the call yourself.
+
+```zig
+const Auth = struct { token: []const u8 };
+
+fn requireToken(context: ?*anyopaque, ctx: *zgrpc.CallContext, request: []const u8, next: zgrpc.server.UnaryNext) anyerror![]const u8 {
+    const auth: *Auth = @ptrCast(@alignCast(context.?));
+    const presented = ctx.metadata("authorization") orelse return ctx.fail(.unauthenticated, "no credentials");
+    if (!std.mem.eql(u8, presented, auth.token)) return ctx.fail(.permission_denied, "wrong credentials");
+    return next.call(ctx, request);
+}
+
+var auth: Auth = .{ .token = "secret" };
+const chain = [_]zgrpc.ServerInterceptor{.{ .context = &auth, .unary = requireToken }};
+var server = try zgrpc.Server.listen(allocator, io, address, &methods, .{ .interceptors = &chain });
+```
+
+The client side takes `zgrpc.ClientInterceptor` in `Pool.Options.interceptors`,
+and receives `options` to change before passing it to `next.call(request, options)`:
+attach `metadata`, tighten the deadline. What comes back is the outcome, a
+`Response` with its status or a transport error, so an interceptor can count
+statuses or time the call.
+
+The first one listed is outermost, and each kind is optional: set `unary`,
+`server_stream`, or both, and a call of the other kind skips it. A
+server-streaming interceptor sees the call begin and end but not each message.
+On the server they run only for a method that exists and a request that reached
+a handler, so an unknown path is answered `UNIMPLEMENTED` before any of them. An
+empty list costs a call a slice-length check.
+
 ## Operating a server
 
 - **Shutdown.** Cancel the task running `serve`, call `server.shutdown(grace_ns)`,
@@ -193,8 +228,8 @@ Server and Client sections above.
   and a compressed response is an error on the client.
 - **No response metadata, no binary metadata.** A handler cannot set response
   headers or trailers beyond the status, and `-bin` names are refused.
-- **No retries, load balancing, interceptors or name resolution.** A pool is
-  several connections to *one* peer.
+- **No retries, load balancing or name resolution.** A pool is several
+  connections to *one* peer.
 - **Stubs are unary and server-streaming only**, and carry from the .proto its
   names, types and the comments above a service and its rpcs, but no options or
   deprecation. See [Protobuf](#protobuf).

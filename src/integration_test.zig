@@ -1759,3 +1759,280 @@ test "typed calls: unary, malformed input, and server streaming" {
         try testing.expectEqual(zgrpc.Code.invalid_argument, stream.finalStatus().code);
     }
 }
+
+// -- interceptors ------------------------------------------------------------
+
+/// What the interceptors saw, in order. Calls in these tests are made one at a
+/// time, so the order is the order they ran in.
+const Trace = struct {
+    entries: [16][]const u8 = undefined,
+    len: std.atomic.Value(usize) = .init(0),
+
+    fn add(self: *Trace, entry: []const u8) void {
+        const i = self.len.fetchAdd(1, .acq_rel);
+        self.entries[i] = entry;
+    }
+
+    fn items(self: *Trace) []const []const u8 {
+        return self.entries[0..self.len.load(.acquire)];
+    }
+};
+
+const Tap = struct {
+    trace: *Trace,
+    in: []const u8,
+    out: []const u8,
+    stream_in: []const u8 = "",
+    stream_out: []const u8 = "",
+};
+
+fn tapUnary(context: ?*anyopaque, ctx: *zgrpc.CallContext, request: []const u8, next: zgrpc.server.UnaryNext) anyerror![]const u8 {
+    const tap: *Tap = @ptrCast(@alignCast(context.?));
+    tap.trace.add(tap.in);
+    defer tap.trace.add(tap.out);
+    return next.call(ctx, request);
+}
+
+fn tapStream(
+    context: ?*anyopaque,
+    ctx: *zgrpc.CallContext,
+    request: []const u8,
+    stream: *zgrpc.ServerStream,
+    next: zgrpc.server.StreamNext,
+) anyerror!void {
+    const tap: *Tap = @ptrCast(@alignCast(context.?));
+    tap.trace.add(tap.stream_in);
+    defer tap.trace.add(tap.stream_out);
+    return next.call(ctx, request, stream);
+}
+
+/// A running server with the shared test methods, and what it takes to stop it.
+const Rig = struct {
+    server: *zgrpc.Server,
+    serving: std.Io.Future(void),
+    authority: []u8,
+    bound: std.Io.net.IpAddress,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+
+    fn start(allocator: std.mem.Allocator, io: std.Io, options: zgrpc.server.Options) !Rig {
+        const server = try allocator.create(zgrpc.Server);
+        errdefer allocator.destroy(server);
+        server.* = try zgrpc.Server.listen(
+            allocator,
+            io,
+            std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+            &methods,
+            options,
+        );
+        const bound = server.boundAddress();
+        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{bound.getPort()});
+        errdefer allocator.free(authority);
+        return .{
+            .server = server,
+            .serving = try io.concurrent(serveTask, .{server}),
+            .authority = authority,
+            .bound = bound,
+            .allocator = allocator,
+            .io = io,
+        };
+    }
+
+    /// After the pool: it has borrowed `authority`.
+    fn stop(self: *Rig) void {
+        _ = self.serving.cancel(self.io);
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+        self.allocator.free(self.authority);
+    }
+};
+
+test "server interceptors run outermost first, and each kind only where it is set" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var trace: Trace = .{};
+    var outer: Tap = .{ .trace = &trace, .in = "outer-in", .out = "outer-out", .stream_in = "outer-stream-in", .stream_out = "outer-stream-out" };
+    var inner: Tap = .{ .trace = &trace, .in = "inner-in", .out = "inner-out" };
+    const chain = [_]zgrpc.ServerInterceptor{
+        .{ .context = &outer, .unary = tapUnary, .server_stream = tapStream },
+        // Unary only: a streaming call must pass straight through it.
+        .{ .context = &inner, .unary = tapUnary },
+    };
+
+    var rig = try Rig.start(allocator, io, .{ .interceptors = &chain });
+    defer rig.stop();
+    const pool = try zgrpc.Pool.init(allocator, io, rig.bound, rig.authority, .{});
+    defer pool.deinit();
+
+    {
+        var response = try pool.call(echo_path, "hi", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("hi", response.message);
+    }
+    try testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "outer-in", "inner-in", "inner-out", "outer-out" }),
+        trace.items(),
+    );
+
+    trace.len.store(0, .release);
+    {
+        var stream = try pool.callServerStream(count_path, "2", .{});
+        defer stream.deinit();
+        while (try stream.next()) |_| {}
+    }
+    // The stream ends after the client sees it finish, so give the trailing
+    // interceptor a moment: it runs when the handler returns.
+    var waited: usize = 0;
+    while (trace.items().len < 2 and waited < 200) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "outer-stream-in", "outer-stream-out" }),
+        trace.items(),
+    );
+}
+
+/// Counts what got past it.
+const Gate = struct {
+    reached: std.atomic.Value(u32) = .init(0),
+    token: []const u8,
+};
+
+fn authUnary(context: ?*anyopaque, ctx: *zgrpc.CallContext, request: []const u8, next: zgrpc.server.UnaryNext) anyerror![]const u8 {
+    const gate: *Gate = @ptrCast(@alignCast(context.?));
+    const presented = ctx.metadata("authorization") orelse return ctx.fail(.unauthenticated, "no credentials");
+    if (!std.mem.eql(u8, presented, gate.token)) return ctx.fail(.permission_denied, "wrong credentials");
+    _ = gate.reached.fetchAdd(1, .monotonic);
+    return next.call(ctx, request);
+}
+
+test "an interceptor can refuse a call before the handler, and a client interceptor can supply the credentials" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var gate: Gate = .{ .token = "secret" };
+    const server_chain = [_]zgrpc.ServerInterceptor{.{ .context = &gate, .unary = authUnary }};
+    var rig = try Rig.start(allocator, io, .{ .interceptors = &server_chain });
+    defer rig.stop();
+
+    // Without credentials: refused, and the handler never ran.
+    {
+        const pool = try zgrpc.Pool.init(allocator, io, rig.bound, rig.authority, .{});
+        defer pool.deinit();
+        var response = try pool.call(echo_path, "hi", .{});
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.unauthenticated, response.call_status.code);
+        try testing.expectEqual(@as(u32, 0), gate.reached.load(.monotonic));
+    }
+
+    // Wrong credentials are a different failure from none.
+    {
+        const pool = try zgrpc.Pool.init(allocator, io, rig.bound, rig.authority, .{});
+        defer pool.deinit();
+        var response = try pool.call(echo_path, "hi", .{ .metadata = &.{.{ .name = "authorization", .value = "nope" }} });
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.permission_denied, response.call_status.code);
+    }
+
+    // A client interceptor attaches the token to every call, so the caller
+    // never mentions it, and sees each outcome on the way back.
+    const Outcomes = struct {
+        statuses: [4]zgrpc.Code = @splat(.unknown),
+        count: usize = 0,
+
+        fn attach(
+            context: ?*anyopaque,
+            path: []const u8,
+            request: []const u8,
+            options: zgrpc.client.CallOptions,
+            next: zgrpc.pool.UnaryNext,
+        ) anyerror!zgrpc.client.Response {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = path;
+            const token = [_]zgrpc.Header{.{ .name = "authorization", .value = "secret" }};
+            var with_token = options;
+            with_token.metadata = &token;
+            const response = try next.call(request, with_token);
+            self.statuses[self.count] = response.call_status.code;
+            self.count += 1;
+            return response;
+        }
+    };
+    var outcomes: Outcomes = .{};
+    const client_chain = [_]zgrpc.ClientInterceptor{.{ .context = &outcomes, .unary = Outcomes.attach }};
+    const pool = try zgrpc.Pool.init(allocator, io, rig.bound, rig.authority, .{ .interceptors = &client_chain });
+    defer pool.deinit();
+
+    {
+        var response = try pool.call(echo_path, "hi", .{});
+        defer response.deinit();
+        try testing.expectEqualStrings("hi", response.message);
+    }
+    {
+        // Reaches the handler, which fails on its own terms.
+        var response = try pool.call(fail_path, "", .{});
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.not_found, response.call_status.code);
+    }
+    try testing.expectEqual(@as(usize, 2), outcomes.count);
+    try testing.expectEqual(zgrpc.Code.ok, outcomes.statuses[0]);
+    try testing.expectEqual(zgrpc.Code.not_found, outcomes.statuses[1]);
+    try testing.expectEqual(@as(u32, 2), gate.reached.load(.monotonic));
+}
+
+test "a client stream interceptor sees the call start, and an unknown method skips the server's chain" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var trace: Trace = .{};
+    var tap: Tap = .{ .trace = &trace, .in = "server-in", .out = "server-out" };
+    const server_chain = [_]zgrpc.ServerInterceptor{.{ .context = &tap, .unary = tapUnary }};
+    var rig = try Rig.start(allocator, io, .{ .interceptors = &server_chain });
+    defer rig.stop();
+
+    const Started = struct {
+        paths: [2][]const u8 = undefined,
+        count: usize = 0,
+
+        fn watch(
+            context: ?*anyopaque,
+            path: []const u8,
+            request: []const u8,
+            options: zgrpc.client.CallOptions,
+            next: zgrpc.pool.StreamNext,
+        ) anyerror!zgrpc.PooledStream {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.paths[self.count] = path;
+            self.count += 1;
+            return next.call(request, options);
+        }
+    };
+    var started: Started = .{};
+    const client_chain = [_]zgrpc.ClientInterceptor{.{ .context = &started, .server_stream = Started.watch }};
+    const pool = try zgrpc.Pool.init(allocator, io, rig.bound, rig.authority, .{ .interceptors = &client_chain });
+    defer pool.deinit();
+
+    {
+        var stream = try pool.callServerStream(count_path, "3", .{});
+        defer stream.deinit();
+        var seen: usize = 0;
+        while (try stream.next()) |_| seen += 1;
+        try testing.expectEqual(@as(usize, 3), seen);
+    }
+    try testing.expectEqual(@as(usize, 1), started.count);
+    try testing.expectEqualStrings(count_path, started.paths[0]);
+
+    // No such method: answered before any interceptor, which is documented
+    // because an auth interceptor might otherwise be assumed to cover it.
+    {
+        var response = try pool.call("/zgrpc.test.Echo/Missing", "", .{});
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.unimplemented, response.call_status.code);
+    }
+    try testing.expectEqual(@as(usize, 0), trace.items().len);
+}
