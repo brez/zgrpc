@@ -173,6 +173,8 @@ const Package = struct {
             output: []const u8,
             camel: []const u8,
             comment: ?[]const u8,
+            /// Declared safe to repeat in the .proto (`idempotency_level`).
+            idempotent: bool,
         };
         var methods: std.ArrayList(Resolved) = .empty;
         for (service.method.items, 0..) |method, method_index| {
@@ -193,6 +195,7 @@ const Package = struct {
                 .output = try self.typeRef(method.output_type.?),
                 .camel = try lowerCamel(self.arena, method_name),
                 .comment = leadingComment(file, &.{ service_field, @intCast(service_index), method_field, @intCast(method_index) }),
+                .idempotent = isIdempotent(method),
             });
         }
 
@@ -277,6 +280,10 @@ const Package = struct {
             const streaming = m.method.server_streaming orelse false;
             try w.writeByte('\n');
             try writeDoc(w, "        ", m.comment);
+            if (m.idempotent) {
+                if (m.comment != null) try w.writeAll("        ///\n");
+                try w.writeAll("        /// Idempotent in the .proto, so a pool may retry it.\n");
+            }
             try w.print(
                 \\        pub fn {f}(
                 \\            self: Client,
@@ -284,17 +291,19 @@ const Package = struct {
                 \\            request: {s},
                 \\            options: zgrpc.client.CallOptions,
                 \\        ) !{s} {{
-                \\            return zgrpc.typed.{s}({s}, {s}, self.pool, allocator, path.{f}, request, options);
+                \\{s}            return zgrpc.typed.{s}({s}, {s}, self.pool, allocator, path.{f}, request, {s});
                 \\        }}
                 \\
             , .{
                 std.zig.fmtId(m.camel),
                 m.input,
                 if (streaming) try std.fmt.allocPrint(self.arena, "zgrpc.typed.Receiver({s})", .{m.output}) else try std.fmt.allocPrint(self.arena, "zgrpc.Reply({s})", .{m.output}),
+                if (m.idempotent) "            var call_options = options;\n            call_options.idempotent = true;\n" else "",
                 if (streaming) "callServerStream" else "call",
                 m.input,
                 m.output,
                 std.zig.fmtId(m.method.name.?),
+                if (m.idempotent) "call_options" else "options",
             });
         }
         try w.writeAll(
@@ -351,6 +360,17 @@ fn writeDoc(w: *std.Io.Writer, indent: []const u8, comment: ?[]const u8) std.Io.
     while (lines.next()) |line| {
         try w.print("{s}///{s}\n", .{ indent, std.mem.trimEnd(u8, line, " \t\r") });
     }
+}
+
+/// Whether the .proto declares the method safe to repeat: `IDEMPOTENT`, or
+/// `NO_SIDE_EFFECTS`, which is stronger. Unset says nothing, and nothing is
+/// assumed.
+fn isIdempotent(method: descriptor.MethodDescriptorProto) bool {
+    const options = method.options orelse return false;
+    return switch (options.idempotency_level orelse .IDEMPOTENCY_UNKNOWN) {
+        .IDEMPOTENT, .NO_SIDE_EFFECTS => true,
+        else => false,
+    };
 }
 
 /// `Get` -> `get`, `GetUser` -> `getUser`: Zig functions are camelCase, and a
@@ -592,4 +612,31 @@ test "comments above a service and a method become doc comments" {
             return error.TestExpectedEqual;
         }
     }
+}
+
+test "a method declared idempotent sets the flag for the caller; others do not" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var read = mkMethod("Read", ".s.Req", ".s.Rep", false, false);
+    read.options = .{ .idempotency_level = .NO_SIDE_EFFECTS };
+    var put = mkMethod("Put", ".s.Req", ".s.Rep", false, false);
+    put.options = .{ .idempotency_level = .IDEMPOTENT };
+    const write = mkMethod("Append", ".s.Req", ".s.Rep", false, false);
+    var unknown = mkMethod("Touch", ".s.Req", ".s.Rep", false, false);
+    unknown.options = .{ .idempotency_level = .IDEMPOTENCY_UNKNOWN };
+
+    const svc = try mkService(arena, "Store", &.{ read, put, write, unknown });
+    const response = try generate(arena, try mkRequest(arena, &.{"s.proto"}, &.{
+        try mkFile(arena, "s.proto", "s", &.{svc}),
+    }));
+    const out = response.file.items[0].content.?;
+
+    // Exactly the two declared methods carry it.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "call_options.idempotent = true;"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "/// Idempotent in the .proto, so a pool may retry it."));
+    const append = std.mem.indexOf(u8, out, "pub fn append(").?;
+    const touch = std.mem.indexOf(u8, out, "pub fn touch(").?;
+    try testing.expect(std.mem.indexOf(u8, out[append..touch], "call_options") == null);
 }

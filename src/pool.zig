@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const client_mod = @import("client.zig");
+const retry = @import("retry.zig");
 const status = @import("status.zig");
 
 const Client = client_mod.Client;
@@ -49,6 +50,14 @@ pub const Options = struct {
     /// Borrowed: the slice and each `context` must outlive the pool. Empty
     /// costs a call nothing.
     interceptors: []const Interceptor = &.{},
+    /// When and how a failed call is sent again. See `retry.Policy`: a call
+    /// that provably never ran is resent regardless, and one that may have run
+    /// only if the caller set `CallOptions.idempotent`.
+    ///
+    /// `CallOptions.deadline_ns` then bounds the whole sequence, attempts and
+    /// waits together, not each attempt. Retries happen below the interceptors,
+    /// so an interceptor sees one call and its final outcome.
+    retry: retry.Policy = .{},
 };
 
 /// Wraps every call made through a `Pool`: attaching credentials, logging,
@@ -97,7 +106,7 @@ pub const UnaryNext = struct {
     remaining: []const Interceptor,
 
     pub fn call(self: UnaryNext, request: []const u8, options: client_mod.CallOptions) anyerror!Response {
-        if (self.remaining.len == 0) return self.pool.callOnConnection(self.path, request, options);
+        if (self.remaining.len == 0) return self.pool.callRetrying(self.path, request, options);
         const rest: UnaryNext = .{ .pool = self.pool, .path = self.path, .remaining = self.remaining[1..] };
         const interceptor = self.remaining[0];
         const run = interceptor.unary orelse return rest.call(request, options);
@@ -111,7 +120,7 @@ pub const StreamNext = struct {
     remaining: []const Interceptor,
 
     pub fn call(self: StreamNext, request: []const u8, options: client_mod.CallOptions) anyerror!PooledStream {
-        if (self.remaining.len == 0) return self.pool.streamOnConnection(self.path, request, options);
+        if (self.remaining.len == 0) return self.pool.streamRetrying(self.path, request, options);
         const rest: StreamNext = .{ .pool = self.pool, .path = self.path, .remaining = self.remaining[1..] };
         const interceptor = self.remaining[0];
         const run = interceptor.server_stream orelse return rest.call(request, options);
@@ -156,6 +165,9 @@ pub const Pool = struct {
 
     closed: bool = false,
 
+    /// Shared by every call on the pool, since what it measures is the peer.
+    throttle: ?retry.Throttle,
+
     /// Opens the pool and its first connection.
     ///
     /// The first connection is established here rather than on the first call:
@@ -187,6 +199,7 @@ pub const Pool = struct {
             .address = address,
             .authority = authority,
             .options = options,
+            .throttle = if (options.retry.throttle) |config| retry.Throttle.init(config) else null,
             .slots = slots,
             .connecting = connecting,
         };
@@ -207,9 +220,13 @@ pub const Pool = struct {
     /// calls before getting here.
     pub fn deinit(self: *Pool) void {
         const io = self.io;
+        // Copied out because the pool frees itself at the end, and the defer
+        // below runs after that: reading `self.allocator` there is a use after
+        // free that only goes unnoticed while the freed memory stays mapped.
+        const allocator = self.allocator;
 
         var doomed: std.ArrayList(*Entry) = .empty;
-        defer doomed.deinit(self.allocator);
+        defer doomed.deinit(allocator);
 
         {
             self.mutex.lockUncancelable(io);
@@ -255,6 +272,73 @@ pub const Pool = struct {
         return next.call(request, call_options);
     }
 
+    fn throttlePtr(self: *Pool) ?*retry.Throttle {
+        return if (self.throttle != null) &self.throttle.? else null;
+    }
+
+    fn callRetrying(
+        self: *Pool,
+        path: []const u8,
+        request: []const u8,
+        call_options: client_mod.CallOptions,
+    ) anyerror!Response {
+        const Attempts = struct {
+            pool: *Pool,
+            path: []const u8,
+            request: []const u8,
+            options: client_mod.CallOptions,
+
+            pub fn attempt(a: *@This(), remaining_ns: ?u64) anyerror!Response {
+                var options = a.options;
+                // What is left of the whole call's budget, not a fresh one.
+                if (remaining_ns != null) options.deadline_ns = remaining_ns;
+                return a.pool.callOnConnection(a.path, a.request, options);
+            }
+
+            pub fn code(_: *@This(), response: *const Response) ?status.Code {
+                return response.call_status.code;
+            }
+
+            pub fn discard(_: *@This(), response: *Response) void {
+                response.deinit();
+            }
+        };
+        var attempts: Attempts = .{ .pool = self, .path = path, .request = request, .options = call_options };
+        return retry.run(Response, self.io, self.options.retry, self.throttlePtr(), call_options.idempotent, call_options.deadline_ns, &attempts);
+    }
+
+    fn streamRetrying(
+        self: *Pool,
+        path: []const u8,
+        request: []const u8,
+        call_options: client_mod.CallOptions,
+    ) anyerror!PooledStream {
+        const Attempts = struct {
+            pool: *Pool,
+            path: []const u8,
+            request: []const u8,
+            options: client_mod.CallOptions,
+
+            pub fn attempt(a: *@This(), remaining_ns: ?u64) anyerror!PooledStream {
+                var options = a.options;
+                if (remaining_ns != null) options.deadline_ns = remaining_ns;
+                return a.pool.streamOnConnection(a.path, a.request, options);
+            }
+
+            // A stream has no status until it ends, so only the failure to
+            // start one is retried here; see the note on `callServerStream`.
+            pub fn code(_: *@This(), _: *const PooledStream) ?status.Code {
+                return null;
+            }
+
+            pub fn discard(_: *@This(), stream: *PooledStream) void {
+                stream.deinit();
+            }
+        };
+        var attempts: Attempts = .{ .pool = self, .path = path, .request = request, .options = call_options };
+        return retry.run(PooledStream, self.io, self.options.retry, self.throttlePtr(), call_options.idempotent, call_options.deadline_ns, &attempts);
+    }
+
     fn callOnConnection(
         self: *Pool,
         path: []const u8,
@@ -268,6 +352,12 @@ pub const Pool = struct {
 
     /// Starts a server-streaming call, through `Options.interceptors`. The
     /// connection is held until the returned stream is deinited.
+    ///
+    /// Retried only until it has started: a call that provably never ran is
+    /// resent, and an idempotent one that fails to open is too. Once this
+    /// returns, a failure (including a refusal that arrives with the first
+    /// response) reaches the caller through `next` and is not retried, because
+    /// that would mean holding the request for the life of the stream.
     pub fn callServerStream(
         self: *Pool,
         path: []const u8,

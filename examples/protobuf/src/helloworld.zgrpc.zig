@@ -44,13 +44,17 @@ pub const Greeter = struct {
         }
 
         /// Replies with one greeting.
+        ///
+        /// Idempotent in the .proto, so a pool may retry it.
         pub fn sayHello(
             self: Client,
             allocator: std.mem.Allocator,
             request: pb.HelloRequest,
             options: zgrpc.client.CallOptions,
         ) !zgrpc.Reply(pb.HelloReply) {
-            return zgrpc.typed.call(pb.HelloRequest, pb.HelloReply, self.pool, allocator, path.SayHello, request, options);
+            var call_options = options;
+            call_options.idempotent = true;
+            return zgrpc.typed.call(pb.HelloRequest, pb.HelloReply, self.pool, allocator, path.SayHello, request, call_options);
         }
 
         /// Replies with `times` greetings, as a stream.

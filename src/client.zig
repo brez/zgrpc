@@ -62,7 +62,29 @@ pub const CallOptions = struct {
     /// `error.InvalidMetadata`, as are `-bin` names: those carry base64 on the
     /// wire and encoding them is not implemented. At most `max_metadata_entries`.
     metadata: []const h2.Header = &.{},
+
+    /// The caller promises that running this call twice is harmless: a read,
+    /// or a write that sets rather than adds. It is what lets a `Pool` retry a
+    /// call that failed in a way that does not prove the server never ran it
+    /// (an UNAVAILABLE status, a connection lost mid-call).
+    ///
+    /// Without it a pool still resends a call that provably never started
+    /// (`error.Unprocessed`), since that is safe for any method, and never
+    /// anything else. Ignored by a bare `Client`, which does not retry.
+    idempotent: bool = false,
 };
+
+/// `Stream.next`, with one change: a reset that proves the peer never started
+/// the call becomes `error.Unprocessed` instead of `error.StreamReset`. The
+/// two are different advice. A call that was reset after the peer may have
+/// acted on it cannot be sent again without risking it running twice; one that
+/// was refused, or sat past a GOAWAY, can.
+fn nextEvent(stream: *h2.Stream, buf: []u8) !h2.Event {
+    return stream.next(buf) catch |err| {
+        if (err == error.StreamReset and stream.wasUnprocessed()) return error.Unprocessed;
+        return err;
+    };
+}
 
 /// Bounds the header block a call can build on the stack.
 pub const max_metadata_entries = 16;
@@ -163,7 +185,7 @@ pub const ResponseStream = struct {
     /// Takes one event off the stream and applies it. Response bytes land
     /// directly in the decoder's buffer.
     fn pump(self: *ResponseStream) !void {
-        switch (try self.stream.next(try self.decoder.reserve(recv_chunk))) {
+        switch (try nextEvent(self.stream, try self.decoder.reserve(recv_chunk))) {
             .headers => |h| {
                 var headers = h;
                 defer headers.deinit();
@@ -424,7 +446,7 @@ pub const Client = struct {
         var call_status: ?Status = null;
 
         done: while (true) {
-            switch (try stream.next(try decoder.reserve(recv_chunk))) {
+            switch (try nextEvent(stream, try decoder.reserve(recv_chunk))) {
                 .headers => |h| {
                     var headers = h;
                     defer headers.deinit();

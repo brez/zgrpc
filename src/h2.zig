@@ -330,6 +330,12 @@ pub const Stream = struct {
     /// RST_STREAM received. The point of the dedicated reader: this becomes
     /// true the moment the frame lands, not when a writer next blocks.
     reset: bool = false,
+    /// With `reset`: the peer cannot have started this stream, so the call can
+    /// be sent again without risk of it running twice. True for a
+    /// REFUSED_STREAM reset (RFC 9113 8.7) and for a stream opened past the
+    /// last one a GOAWAY says was processed (6.8). Any other reset says
+    /// nothing about whether the peer got as far as acting on the request.
+    unprocessed: bool = false,
 
     /// Flow-control credit for DATA we send on this stream.
     send_window: i64,
@@ -470,6 +476,15 @@ pub const Stream = struct {
         self.conn.mutex.lockUncancelable(io);
         defer self.conn.mutex.unlock(io);
         return expired(io, self.deadline);
+    }
+
+    /// True if the stream was reset and the peer provably never started it;
+    /// see the field of the same name.
+    pub fn wasUnprocessed(self: *Stream) bool {
+        const io = self.conn.io;
+        self.conn.mutex.lockUncancelable(io);
+        defer self.conn.mutex.unlock(io);
+        return self.reset and self.unprocessed;
     }
 
     /// True once the peer has reset this stream. Cheap enough to check before
@@ -712,15 +727,18 @@ pub const Connection = struct {
             // REFUSED_STREAM, and a caller that issued one call too many would
             // rather be queued for a moment than told no.
             const limit = self.peer_max_concurrent_streams orelse default_max_concurrent_streams;
+            //
+            // A connection that is closed, or has said GOAWAY, fails here
+            // before anything is sent, so the error is `Unprocessed`: the
+            // request provably went nowhere, and a caller can send it again on
+            // another connection without risk.
             while (self.local_streams >= limit) {
-                if (self.closed) return self.closeReason();
-                if (self.goaway_received != null) return error.ConnectionClosed;
+                if (self.closed or self.goaway_received != null) return error.Unprocessed;
                 if (expired(io, deadline)) return error.DeadlineExceeded;
                 try self.stream_slots.wait(io, &self.mutex, timeoutFor(deadline));
             }
 
-            if (self.closed) return self.closeReason();
-            if (self.goaway_received != null) return error.ConnectionClosed;
+            if (self.closed or self.goaway_received != null) return error.Unprocessed;
 
             const id = self.next_stream_id;
             self.next_stream_id += 2;
@@ -1351,6 +1369,7 @@ pub const Connection = struct {
             const s = stream.*;
             if (s.id % 2 == ours_parity and s.id > last) {
                 s.reset = true;
+                s.unprocessed = true;
                 try self.noteWake(s.id);
             }
         }
@@ -1391,6 +1410,11 @@ pub const Connection = struct {
 
         if (self.streams.get(frame.header.stream_id)) |stream| {
             stream.reset = true;
+            if (frame.payload.len >= 4 and
+                std.mem.readInt(u32, frame.payload[0..4], .big) == error_code_refused_stream)
+            {
+                stream.unprocessed = true;
+            }
             try self.noteWake(stream.id);
         }
         // Woken regardless: a writer parked for credit on this stream has to
@@ -1751,6 +1775,78 @@ test "a GOAWAY resets the streams we opened past its last stream id" {
 
     try testing.expect(!conn.streams.get(1).?.reset);
     try testing.expect(conn.streams.get(3).?.reset);
+}
+
+test "a stream past a GOAWAY's last id is unprocessed, and one before it is not" {
+    var r = std.Io.Reader.fixed("");
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, false);
+    defer conn.deinit();
+
+    for ([_]u32{ 1, 3 }) |id| {
+        const stream = try testing.allocator.create(Stream);
+        stream.* = .{ .conn = &conn, .id = id, .send_window = protocol_initial_window };
+        try conn.streams.put(testing.allocator, id, stream);
+    }
+
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], 1, .big);
+    std.mem.writeInt(u32, payload[4..8], 0, .big);
+    try conn.applyGoAway(.{
+        .header = .{ .length = 8, .frame_type = .GOAWAY, .flags = FrameFlags.init(0), .reserved = false, .stream_id = 0 },
+        .payload = &payload,
+    });
+
+    // Stream 1 was processed, so a retry could run it twice; 3 never was.
+    try testing.expect(!conn.streams.get(1).?.wasUnprocessed());
+    try testing.expect(conn.streams.get(3).?.wasUnprocessed());
+}
+
+test "only REFUSED_STREAM says a reset stream was never started" {
+    var r = std.Io.Reader.fixed("");
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, false);
+    defer conn.deinit();
+
+    for ([_]u32{ 1, 3 }) |id| {
+        const stream = try testing.allocator.create(Stream);
+        stream.* = .{ .conn = &conn, .id = id, .send_window = protocol_initial_window };
+        try conn.streams.put(testing.allocator, id, stream);
+    }
+
+    const cancel: u32 = 0x8;
+    for ([_]struct { id: u32, code: u32 }{
+        .{ .id = 1, .code = error_code_refused_stream },
+        .{ .id = 3, .code = cancel },
+    }) |case| {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, case.code, .big);
+        try conn.applyRstStream(.{
+            .header = .{ .length = 4, .frame_type = .RST_STREAM, .flags = FrameFlags.init(0), .reserved = false, .stream_id = case.id },
+            .payload = &payload,
+        });
+    }
+
+    try testing.expect(conn.streams.get(1).?.wasUnprocessed());
+    // CANCEL may arrive after the peer acted on the request, so a resend of it
+    // could run twice: reset, but not provably unprocessed.
+    try testing.expect(conn.streams.get(3).?.isReset());
+    try testing.expect(!conn.streams.get(3).?.wasUnprocessed());
+}
+
+test "opening a stream on a connection that said GOAWAY fails as unprocessed" {
+    var r = std.Io.Reader.fixed("");
+    var sink: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    var conn = Connection.init(testing.allocator, testing.io, &r, &w, false);
+    defer conn.deinit();
+
+    conn.goaway_received = .{ .last_stream_id = 0, .error_code = 0 };
+    try testing.expectError(error.Unprocessed, conn.openStream(&.{}, false, null));
+    // Nothing was written: the point of the error is that nothing was sent.
+    try testing.expectEqual(@as(usize, 0), w.end);
 }
 
 test "a reader keeps answering after GOAWAY" {

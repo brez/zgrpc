@@ -32,16 +32,16 @@ consumer. Specifically avoid over-building before there's a second
 consumer to validate the abstractions against:
 
 - Unary RPCs first. Server streaming once unary is proven and benchmarked.
-- No retries, no client-side load balancing, no service discovery. These are
-  real gRPC features but nobody needs them yet. (Interceptors were on this
+- No client-side load balancing, no service discovery. These are real gRPC
+  features but nobody needs them yet. (Interceptors and retries were on this
   list and are built; see the exception below.)
 - No TLS/ALPN until a concrete use case requires leaving the VPC.
 
 One deliberate exception: on 2026-10-19 the stated goal became a general-purpose
-library, not one shaped around harvezter, so stubs and then interceptors were
-built ahead of a second consumer, and retries, name resolution and load
-balancing are planned, in that order (see "Next up"). The rule above still
-governs everything else on that list.
+library, not one shaped around harvezter, so stubs, interceptors and retries were
+built ahead of a second consumer, and name resolution and load balancing are
+planned (see "Next up"). The rule above still governs everything else on that
+list.
 
 ## Architecture (layers, bottom to top)
 
@@ -213,6 +213,32 @@ and the later `Channel` will take the same chain. Interceptor functions return
 `anyerror`, which widens `Pool.call`'s error set; callers already needed an
 `else` for transport errors.
 
+**Retries** (`src/retry.zig`, driven from `Pool`): two kinds with different
+safety, which is the whole design. A call that provably never ran is resent
+for any method, at once, capped at 2: that is `error.Unprocessed`, raised for
+REFUSED_STREAM, a stream past a GOAWAY's last id (RFC 9113 6.8, 8.7), and a
+connection closed before anything was sent. A call that may have run
+(UNAVAILABLE, a connection lost mid-call) is resent only when the caller sets
+`CallOptions.idempotent`, with backoff and jitter, gRPC's token-bucket
+throttle, and `deadline_ns` bounding the sequence. The engine is a function over
+scripted attempts, so every rule is unit-tested with no sockets; the pool tests
+cover the wiring. Decisions with reasons:
+- *`error.StreamReset` could not say which kind.* It covered a REFUSED_STREAM
+  and a reset after the peer had acted. h2 now records why a stream was reset
+  (`Stream.unprocessed`), and the client turns the provable cases into
+  `Unprocessed`. That replaces `StreamReset` and `ConnectionClosed` for those
+  cases, which is a visible change to bare-`Client` callers.
+- *The throttle counts failures even for calls it does not retry*, so the bucket
+  reflects the server's health, not how many callers opted in.
+- *Streams are retried only until they start.* Retrying a refusal that arrives
+  with the first message would mean holding the request for the stream's life.
+- *Retries sit below interceptors*, as in gRPC: an interceptor sees one call.
+- A method's `idempotency_level` in the .proto sets `idempotent` in the
+  generated client, so it is declared once, where the method is.
+Found on the way: `Pool.deinit` read `self.allocator` in a defer that ran after
+it had freed itself, a use after free that went unnoticed until a larger struct
+changed what the freed memory held. Fixed with a local copy.
+
 **Concurrency model**: a unit of concurrency per connection, per connection a
 reader task that owns the read side, and per stream a task running the call.
 Writers take a separate lock from connection state and the two are never held
@@ -282,18 +308,13 @@ Next up:
   (above peak call rate divided by pool size); raise it for a busier pool, not
   `null`, which removes the only protection against a client resetting in a
   loop.
-- Retries, next. Decided: retry a call the server provably never started
-  (refused stream, GOAWAY past the last id) always; retry UNAVAILABLE and the
-  like only when the caller marks the call idempotent, because a retried write
-  that did reach the server can run twice. Per-call policy with attempts,
-  exponential backoff with jitter, bounded by the call's deadline; streams only
-  before the first message. Lives in the pool, not as an interceptor, since it
-  needs to know about connections.
-- Then a `Channel`: a resolver (DNS or a static list, re-resolved on a
+- A `Channel`: a resolver (DNS or a static list, re-resolved on a
   schedule) feeding one `Pool` per address, a picker over them, a down-mark with
   backoff for a failing address, and retries gaining the option of another
   peer. `zgrpc.typed` already needs only `call`/`callServerStream`, so stubs
-  would take a `Channel` as readily as a `Pool`.
+  would take a `Channel` as readily as a `Pool`. Two retry gaps close with it: a
+  failure to connect (retried against another address) and, if wanted, a stream
+  refused with its first message.
 - Let harvezter use the stubs (released in v0.3.0): bump its pin, and adopt the
   generated client and `Methods(Impl)` once it has a `.proto` of its own.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.

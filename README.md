@@ -148,6 +148,9 @@ defer reply.deinit();
 if (reply.message) |m| { /* m.message */ } else { /* reply.status.code */ }
 ```
 
+A method marked `option idempotency_level = IDEMPOTENT;` (or `NO_SIDE_EFFECTS`)
+in the `.proto` is retried by the pool; see [Retries](#retries).
+
 A server-streaming call returns a receiver: `while (try stream.next()) |m|`, then
 `stream.finalStatus()`. Unary and server-streaming rpcs only; a client- or
 bidirectionally-streaming one fails generation rather than vanishing from the
@@ -199,6 +202,42 @@ On the server they run only for a method that exists and a request that reached
 a handler, so an unknown path is answered `UNIMPLEMENTED` before any of them. An
 empty list costs a call a slice-length check.
 
+## Retries
+
+A `Pool` sends a failed call again in two cases, and what separates them is
+whether the call could end up running twice.
+
+- **It provably never ran** (`error.Unprocessed`): the peer refused the stream,
+  it sat past a GOAWAY, or the connection was already closed when the call
+  began. This is resent at once on another connection, up to twice, for any
+  method. It is what turns a rolling restart into nothing.
+- **It may have run**: the server answered UNAVAILABLE, or the connection was
+  lost mid-call. This is resent only if the caller sets `idempotent`, because a
+  write that did reach the server would run twice.
+
+```zig
+var response = try pool.call(path, request, .{
+    .idempotent = true,
+    .deadline_ns = 200 * std.time.ns_per_ms, // all attempts and waits together
+});
+```
+
+The second kind makes up to 3 attempts, waiting 50ms, then 100ms, up to 2s,
+each a random fraction of that so callers that failed together do not retry
+together. It is also throttled the way gRPC does it: failures drain a bucket of
+tokens, successes refill it a little, and with the bucket under half full a
+failing server is left alone instead of being retried against.
+`Pool.Options.retry` (a `zgrpc.RetryPolicy`) sets all of it: attempts, backoff,
+which statuses count, the throttle. `max_attempts = 1` and `max_unprocessed = 0`
+turn retrying off. A method declared `IDEMPOTENT` or `NO_SIDE_EFFECTS` in the
+`.proto` sets `idempotent` itself in its generated client.
+
+Limits. A server-streaming call is retried only until it has started; a failure
+after that reaches you through `next`. A failure to connect is not retried, since
+a pool has one address to try; that waits for several. A bare `Client` does not
+retry. Retries run below the interceptors, so an interceptor sees one call and
+its final outcome.
+
 ## Operating a server
 
 - **Shutdown.** Cancel the task running `serve`, call `server.shutdown(grace_ns)`,
@@ -228,8 +267,8 @@ empty list costs a call a slice-length check.
   and a compressed response is an error on the client.
 - **No response metadata, no binary metadata.** A handler cannot set response
   headers or trailers beyond the status, and `-bin` names are refused.
-- **No retries, load balancing or name resolution.** A pool is several
-  connections to *one* peer.
+- **No load balancing or name resolution.** A pool is several connections to
+  *one* peer. Retries exist, within the limits under [Retries](#retries).
 - **Stubs are unary and server-streaming only**, and carry from the .proto its
   names, types and the comments above a service and its rpcs, but no options or
   deprecation. See [Protobuf](#protobuf).
@@ -242,11 +281,11 @@ empty list costs a call a slice-length check.
 ## Development
 
 ```
-zig build test              # unit + integration tests (129)
+zig build test              # unit + integration tests (173)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency, plus pool throughput under load
-zig build test-gen -Dgenerator=true  # the stub generator's tests (6)
+zig build test-gen -Dgenerator=true  # the stub generator's tests (8)
 ./interop/run.sh            # grpc-go interop suite, 15 checks (requires Go)
 ./packaging/verify.sh       # fetch and use it as a published dependency
 

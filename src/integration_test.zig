@@ -160,7 +160,21 @@ const deadline_report_path = "/zgrpc.test.Echo/DeadlineReport";
 const slow_path = "/zgrpc.test.Echo/Slow";
 const stalled_path = "/zgrpc.test.Echo/Stalled";
 
+/// Fails with UNAVAILABLE for its first `flaky_failures` calls, then succeeds.
+/// Tests set both globals before use; they run one at a time.
+const flaky_path = "/zgrpc.test.Echo/Flaky";
+var flaky_calls: std.atomic.Value(u32) = .init(0);
+var flaky_failures: std.atomic.Value(u32) = .init(0);
+
+fn flakyHandler(ctx: *zgrpc.CallContext, request: []const u8) anyerror![]const u8 {
+    _ = request;
+    const n = flaky_calls.fetchAdd(1, .monotonic);
+    if (n < flaky_failures.load(.monotonic)) return ctx.fail(.unavailable, "try again");
+    return ctx.allocator.dupe(u8, "ok");
+}
+
 const methods = [_]zgrpc.Method{
+    zgrpc.Method.unary(flaky_path, flakyHandler),
     zgrpc.Method.unary(echo_path, echoHandler),
     zgrpc.Method.unary(metadata_path, metadataHandler),
     zgrpc.Method.unary(deadline_report_path, deadlineReportHandler),
@@ -1347,7 +1361,10 @@ test "shutdown lets a call in flight finish and refuses new ones" {
     // on will not start another on this connection.
     try testing.expect(waitUnusable(fx.client, io, 500));
     try testing.expectEqual(@as(u8, 0), clean.load(.acquire)); // still draining
-    try testing.expectError(error.ConnectionClosed, fx.client.call(echo_path, "late", .{}));
+    // Refused before anything was sent, which is exactly what `Unprocessed`
+    // says: a pool resends such a call on another connection without asking
+    // whether the method is idempotent.
+    try testing.expectError(error.Unprocessed, fx.client.call(echo_path, "late", .{}));
 
     try calls.await(io);
     // The point of the whole exercise: the call that was running was not cut.
@@ -2035,4 +2052,152 @@ test "a client stream interceptor sees the call start, and an unknown method ski
         try testing.expectEqual(zgrpc.Code.unimplemented, response.call_status.code);
     }
     try testing.expectEqual(@as(usize, 0), trace.items().len);
+}
+
+// -- retries -----------------------------------------------------------------
+
+/// Backoff short enough that a test waits milliseconds, not the defaults.
+const quick_retry: zgrpc.RetryPolicy = .{ .initial_backoff_ns = std.time.ns_per_ms, .max_backoff_ns = 4 * std.time.ns_per_ms };
+
+fn flakyFor(failures: u32) void {
+    flaky_calls.store(0, .monotonic);
+    flaky_failures.store(failures, .monotonic);
+}
+
+test "an idempotent call is retried past UNAVAILABLE; one that is not is left alone" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .retry = quick_retry });
+    defer pool.deinit();
+
+    flakyFor(2);
+    {
+        var response = try pool.call(flaky_path, "", .{ .idempotent = true });
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.ok, response.call_status.code);
+        try testing.expectEqualStrings("ok", response.message);
+    }
+    try testing.expectEqual(@as(u32, 3), flaky_calls.load(.monotonic));
+
+    // The same failures, but the caller never said running it twice is safe:
+    // the server may have acted on the first, and the answer stands.
+    flakyFor(2);
+    {
+        var response = try pool.call(flaky_path, "", .{});
+        defer response.deinit();
+        try testing.expectEqual(zgrpc.Code.unavailable, response.call_status.code);
+    }
+    try testing.expectEqual(@as(u32, 1), flaky_calls.load(.monotonic));
+}
+
+test "retries stop at max_attempts, and the last status is what comes back" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+    var policy = quick_retry;
+    policy.max_attempts = 4;
+    policy.throttle = null;
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .retry = policy });
+    defer pool.deinit();
+
+    flakyFor(1000);
+    var response = try pool.call(flaky_path, "", .{ .idempotent = true });
+    defer response.deinit();
+    try testing.expectEqual(zgrpc.Code.unavailable, response.call_status.code);
+    try testing.expectEqualStrings("try again", response.call_status.message);
+    try testing.expectEqual(@as(u32, 4), flaky_calls.load(.monotonic));
+}
+
+test "the deadline bounds the retries and the waits between them" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+    // A wait of up to an hour between attempts, against a 200ms deadline.
+    const hour = 3600 * std.time.ns_per_s;
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{
+        .retry = .{ .initial_backoff_ns = hour, .max_backoff_ns = hour },
+    });
+    defer pool.deinit();
+
+    flakyFor(1000);
+    const started = std.Io.Timestamp.now(io, .awake);
+    var response = try pool.call(flaky_path, "", .{ .idempotent = true, .deadline_ns = 200 * std.time.ns_per_ms });
+    defer response.deinit();
+    const elapsed_ms = @divTrunc(started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds, std.time.ns_per_ms);
+
+    // It did not wait out the backoff: it gave the first answer back.
+    try testing.expectEqual(zgrpc.Code.unavailable, response.call_status.code);
+    try testing.expect(elapsed_ms < 1000);
+    try testing.expectEqual(@as(u32, 1), flaky_calls.load(.monotonic));
+}
+
+test "the throttle stops retrying against a server that keeps failing" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    defer fixture.stopServer();
+    // Default throttle: 10 tokens, retries only above 5. Each failure costs 1.
+    const pool = try zgrpc.Pool.init(allocator, io, fixture.bound, fixture.authority, .{ .retry = quick_retry });
+    defer pool.deinit();
+
+    flakyFor(1000);
+    // Call 1: 10 -> 9 (retry), 8 (retry), 7, and the 3-attempt cap ends it: 3 sent.
+    // Call 2: 6 (retry), 5 (not above 5, so no retry): 2 sent.
+    // Call 3: 4: no retry at all: 1 sent.
+    for (0..3) |_| {
+        var response = try pool.call(flaky_path, "", .{ .idempotent = true });
+        response.deinit();
+    }
+    try testing.expectEqual(@as(u32, 6), flaky_calls.load(.monotonic));
+}
+
+test "a call refused before it was sent reports Unprocessed, not a bare connection error" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fixture = try PoolFixture.start(allocator, io);
+    defer fixture.deinit();
+    const client = try zgrpc.Client.connect(allocator, io, fixture.bound, fixture.authority, .{});
+    defer client.deinit();
+
+    // One call first, so the server has accepted the connection: connecting
+    // can complete before its accept loop has picked it up, and a connection
+    // it never saw has no GOAWAY to receive.
+    {
+        var warm = try client.call(echo_path, "warm", .{});
+        warm.deinit();
+    }
+
+    // Tear down the server side so the connection is told GOAWAY.
+    _ = fixture.serving.cancel(io);
+    try testing.expect(fixture.server.shutdown(2 * std.time.ns_per_s));
+    var waited: usize = 0;
+    while (client.isUsable() and waited < 300) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expect(!client.isUsable());
+
+    try testing.expectError(error.Unprocessed, client.call(echo_path, "late", .{}));
+    fixture.server.deinit();
+    fixture.allocator.destroy(fixture.server);
 }

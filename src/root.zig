@@ -21,6 +21,7 @@ pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 pub const pool = @import("pool.zig");
 pub const typed = @import("typed.zig");
+pub const retry = @import("retry.zig");
 
 pub const Keepalive = h2.Keepalive;
 pub const Header = h2.Header;
@@ -30,6 +31,7 @@ pub const Client = client.Client;
 pub const Pool = pool.Pool;
 pub const PooledStream = pool.PooledStream;
 pub const ClientInterceptor = pool.Interceptor;
+pub const RetryPolicy = retry.Policy;
 pub const Server = server.Server;
 pub const Method = server.Method;
 pub const ServerStream = server.ServerStream;
@@ -50,4 +52,5 @@ test {
     _ = server;
     _ = pool;
     _ = typed;
+    _ = retry;
 }

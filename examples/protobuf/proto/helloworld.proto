@@ -19,7 +19,10 @@ message HelloTimesRequest {
 // the generated service and client (`zig build gen-proto`, src/helloworld.zgrpc.zig).
 service Greeter {
   // Replies with one greeting.
-  rpc SayHello (HelloRequest) returns (HelloReply);
+  rpc SayHello (HelloRequest) returns (HelloReply) {
+    // Greeting the same name twice is harmless, so a pool may retry it.
+    option idempotency_level = IDEMPOTENT;
+  }
 
   // Replies with `times` greetings, as a stream.
   rpc SayHelloTimes (HelloTimesRequest) returns (stream HelloReply);
