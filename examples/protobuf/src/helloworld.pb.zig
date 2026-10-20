@@ -205,14 +205,16 @@ pub const HelloTimesRequest = struct {
     }
 };
 
-/// `zig build gen-proto` turns this block into src/helloworld.zgrpc.zig: the
-/// method paths, a typed client, and the table of handlers a server takes.
+/// Greets people. This comment, and the ones on the rpcs, become doc comments on
+/// the generated service and client (`zig build gen-proto`, src/helloworld.zgrpc.zig).
 pub fn Greeter(comptime UserDataType: type, comptime ErrorSet: type) type {
     return struct {
         pub const package = "helloworld";
         pub const service_name = "Greeter";
 
+        /// Replies with one greeting.
         SayHello: *const fn (userdata: *UserDataType, request: HelloRequest) ErrorSet!HelloReply,
+        /// Replies with `times` greetings, as a stream.
         SayHelloTimes: *const fn (userdata: *UserDataType, request: HelloTimesRequest, writer_queue: *std.Io.Queue(HelloReply)) ErrorSet!void,
     };
 }

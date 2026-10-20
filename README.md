@@ -192,9 +192,9 @@ Server and Client sections above.
   headers or trailers beyond the status, and `-bin` names are refused.
 - **No retries, load balancing, interceptors or name resolution.** A pool is
   several connections to *one* peer.
-- **Stubs are unary and server-streaming only**, and carry nothing from the
-  .proto but names and types: no doc comments, options or deprecation. See
-  [Protobuf](#protobuf).
+- **Stubs are unary and server-streaming only**, and carry from the .proto its
+  names, types and the comments above a service and its rpcs, but no options or
+  deprecation. See [Protobuf](#protobuf).
 - **Deadlines bound waiting, not working.** Every wait a call makes is bounded,
   but a handler burning CPU cannot be preempted, and neither connecting nor a
   socket write to a peer that has stopped draining TCP is covered.

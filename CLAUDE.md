@@ -190,7 +190,8 @@ Output is one `<package>.zgrpc.zig` per package, next to zig-protobuf's
 second protoc pass through `RunProtocStep.createWithGenerator`, which only
 hands protoc a plugin and an output directory. A client- or
 bidirectionally-streaming rpc fails generation: a stub missing a method is a
-worse surprise than no stub. Doc comments and options are not carried over.
+worse surprise than no stub. The comment above a service or an rpc becomes a
+doc comment (client methods, service); options and deprecation are not carried.
 Not checked against grpc-go: the typed layer changes only what turns bytes
 into messages, and interop already covers the bytes.
 

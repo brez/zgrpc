@@ -4,6 +4,8 @@ const std = @import("std");
 const zgrpc = @import("zgrpc");
 const pb = @import("helloworld.pb.zig");
 
+/// Greets people. This comment, and the ones on the rpcs, become doc comments on
+/// the generated service and client (`zig build gen-proto`, src/helloworld.zgrpc.zig).
 pub const Greeter = struct {
     pub const full_name = "helloworld.Greeter";
 
@@ -41,6 +43,7 @@ pub const Greeter = struct {
             return .{ .pool = pool };
         }
 
+        /// Replies with one greeting.
         pub fn sayHello(
             self: Client,
             allocator: std.mem.Allocator,
@@ -50,6 +53,7 @@ pub const Greeter = struct {
             return zgrpc.typed.call(pb.HelloRequest, pb.HelloReply, self.pool, allocator, path.SayHello, request, options);
         }
 
+        /// Replies with `times` greetings, as a stream.
         pub fn sayHelloTimes(
             self: Client,
             allocator: std.mem.Allocator,

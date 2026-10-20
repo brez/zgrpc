@@ -90,8 +90,8 @@ pub fn generate(arena: Allocator, request: plugin.CodeGeneratorRequest) Allocato
             break :blk created;
         };
 
-        for (file.service.items) |service| {
-            package.emitService(service) catch |err| switch (err) {
+        for (file.service.items, 0..) |service, index| {
+            package.emitService(file, index, service) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
                 error.Unsupported => {
                     response.@"error" = package.problem;
@@ -156,14 +156,26 @@ const Package = struct {
         return std.fmt.allocPrint(self.arena, "{s}.{s}", .{ try importName(self.arena, package), rest });
     }
 
-    fn emitService(self: *Package, service: descriptor.ServiceDescriptorProto) Error!void {
+    fn emitService(
+        self: *Package,
+        file: *const descriptor.FileDescriptorProto,
+        service_index: usize,
+        service: descriptor.ServiceDescriptorProto,
+    ) Error!void {
         const service_name = service.name.?;
         const w = &self.body.writer;
+        const service_path = [_]i32{ service_field, @intCast(service_index) };
 
         // Resolve every type first: a failure should leave nothing half-written.
-        const Resolved = struct { method: descriptor.MethodDescriptorProto, input: []const u8, output: []const u8, camel: []const u8 };
+        const Resolved = struct {
+            method: descriptor.MethodDescriptorProto,
+            input: []const u8,
+            output: []const u8,
+            camel: []const u8,
+            comment: ?[]const u8,
+        };
         var methods: std.ArrayList(Resolved) = .empty;
-        for (service.method.items) |method| {
+        for (service.method.items, 0..) |method, method_index| {
             const method_name = method.name.?;
             const client_streaming = method.client_streaming orelse false;
             const server_streaming = method.server_streaming orelse false;
@@ -180,11 +192,13 @@ const Package = struct {
                 .input = try self.typeRef(method.input_type.?),
                 .output = try self.typeRef(method.output_type.?),
                 .camel = try lowerCamel(self.arena, method_name),
+                .comment = leadingComment(file, &.{ service_field, @intCast(service_index), method_field, @intCast(method_index) }),
             });
         }
 
+        try w.writeByte('\n');
+        try writeDoc(w, "", leadingComment(file, &service_path));
         try w.print(
-            \\
             \\pub const {f} = struct {{
             \\    pub const full_name = "{s}.{s}";
             \\
@@ -261,8 +275,9 @@ const Package = struct {
         );
         for (methods.items) |m| {
             const streaming = m.method.server_streaming orelse false;
+            try w.writeByte('\n');
+            try writeDoc(w, "        ", m.comment);
             try w.print(
-                \\
                 \\        pub fn {f}(
                 \\            self: Client,
                 \\            allocator: std.mem.Allocator,
@@ -311,6 +326,32 @@ const Package = struct {
         return out.written();
     }
 };
+
+/// FileDescriptorProto field numbers for `service`, and
+/// ServiceDescriptorProto's for `method`: a comment's location is found by the
+/// path of field numbers and indexes that leads to its element.
+const service_field = 6;
+const method_field = 2;
+
+/// The comment directly above the element at `path`, or null. protoc only
+/// sends source info for the files it was asked to generate.
+fn leadingComment(file: *const descriptor.FileDescriptorProto, path: []const i32) ?[]const u8 {
+    const info = file.source_code_info orelse return null;
+    for (info.location.items) |location| {
+        if (std.mem.eql(i32, location.path.items, path)) return location.leading_comments;
+    }
+    return null;
+}
+
+/// A .proto comment as Zig doc comments. protoc keeps the space after `//`, so
+/// ` foo` becomes `/// foo`, and a blank line stays a bare `///`.
+fn writeDoc(w: *std.Io.Writer, indent: []const u8, comment: ?[]const u8) std.Io.Writer.Error!void {
+    const text = std.mem.trimEnd(u8, comment orelse return, "\n");
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try w.print("{s}///{s}\n", .{ indent, std.mem.trimEnd(u8, line, " \t\r") });
+    }
+}
 
 /// `Get` -> `get`, `GetUser` -> `getUser`: Zig functions are camelCase, and a
 /// method name is the one thing a .proto spells in PascalCase.
@@ -513,4 +554,42 @@ test "files with no services produce nothing" {
     }));
     try testing.expect(response.@"error" == null);
     try testing.expectEqual(@as(usize, 0), response.file.items.len);
+}
+
+test "comments above a service and a method become doc comments" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const greeter = try mkService(arena, "Greeter", &.{
+        mkMethod("SayHello", ".helloworld.HelloRequest", ".helloworld.HelloReply", false, false),
+        mkMethod("Quiet", ".helloworld.HelloRequest", ".helloworld.HelloReply", false, false),
+    });
+    var f = try mkFile(arena, "h.proto", "helloworld", &.{greeter});
+
+    var info: descriptor.SourceCodeInfo = .{};
+    var service_loc: descriptor.SourceCodeInfo.Location = .{
+        .leading_comments = " Greets people.\n\n Politely.\n",
+    };
+    try service_loc.path.appendSlice(arena, &.{ 6, 0 });
+    var method_loc: descriptor.SourceCodeInfo.Location = .{ .leading_comments = " Says hello.\n" };
+    try method_loc.path.appendSlice(arena, &.{ 6, 0, 2, 0 });
+    try info.location.appendSlice(arena, &.{ service_loc, method_loc });
+    f.source_code_info = info;
+
+    const response = try generate(arena, try mkRequest(arena, &.{"h.proto"}, &.{f}));
+    try testing.expect(response.@"error" == null);
+    const out = response.file.items[0].content.?;
+
+    for ([_][]const u8{
+        "\n/// Greets people.\n///\n/// Politely.\npub const Greeter = struct {",
+        "\n        /// Says hello.\n        pub fn sayHello(",
+        // The method with no comment gets none, and not its neighbour's.
+        "        }\n\n        pub fn quiet(",
+    }) |needle| {
+        if (std.mem.indexOf(u8, out, needle) == null) {
+            std.debug.print("missing {s}\n--- generated:\n{s}\n", .{ needle, out });
+            return error.TestExpectedEqual;
+        }
+    }
 }
