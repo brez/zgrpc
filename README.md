@@ -6,7 +6,8 @@ Real gRPC over HTTP/2 (h2c) for Zig — the actual wire protocol, verified
 against the reference `grpc-go` implementation.
 
 Unary and server-streaming calls, concurrent connections and calls, a
-connection pool, and enforced deadlines. Zig 0.16.0.
+connection pool, enforced deadlines, and typed stubs generated from a `.proto`.
+Zig 0.16.0.
 
 ## Installing
 
@@ -203,15 +204,16 @@ Server and Client sections above.
 ## Development
 
 ```
-zig build test              # unit + integration tests (81)
+zig build test              # unit + integration tests (129)
 zig build test-unit         # pure unit tests only, no sockets
 zig build test-integration  # real client/server over loopback
 zig build bench             # loopback latency, plus pool throughput under load
-./interop/run.sh            # grpc-go interop suite, 13 checks (requires Go)
+zig build test-gen -Dgenerator=true  # the stub generator's tests (6)
+./interop/run.sh            # grpc-go interop suite, 15 checks (requires Go)
 ./packaging/verify.sh       # fetch and use it as a published dependency
 
-cd examples/protobuf && zig build run        # the protobuf example
-cd examples/protobuf && zig build gen-proto  # regenerate its .pb.zig
+cd examples/protobuf && zig build run        # the protobuf example, on generated stubs
+cd examples/protobuf && zig build gen-proto  # regenerate its .pb.zig and .zgrpc.zig
 ```
 
 `interop/` is the check that matters: our own client agreeing with our own
@@ -220,12 +222,14 @@ building in this repo does not prove a consumer can build against it.
 
 [docs/notes.md](docs/notes.md) has the design rationale and the measurements
 behind it: what the concurrency model costs, why the flow-control windows are
-the size they are, and the bugs interop and benchmarking found.
+the size they are, the bugs interop and benchmarking found, and the in-VPC
+latency numbers (us-east-1: worst fixed-rate p999 under 1ms against a ~5ms
+budget).
 
 ## Versioning
 
 **v0.3.0**, semantic, with 0.x meaning the Zig API may still move — with one
-consumer, an awkward API is worth breaking rather than living with. The wire
+consumer so far, an awkward API is worth breaking rather than living with. The wire
 behaviour is the stable part, and the interop suite is what a bump has to keep
 passing.
 
