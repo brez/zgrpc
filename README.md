@@ -176,7 +176,10 @@ Server and Client sections above.
   turns it off.
 - **Reset limit.** `Server.Options.reset_limit` (default 2,000/s, burst 4,000)
   disconnects a peer that cancels streams faster than that, which is the
-  rapid-reset attack. `null` turns it off.
+  rapid-reset attack. `null` turns it off. It is per connection, and callers
+  timing out in bulk during an outage reset streams about as fast as they were
+  calling, so keep it well above your peak call rate divided by the pool size
+  (default 4), or an honest pool gets cut off when it can least afford it.
 - **Metadata.** `CallOptions.metadata` sends request headers, validated before
   anything goes out; handlers read them with `ctx.metadata("name")`.
 - **Limits on what a peer can send.** Frames, header blocks and header lists

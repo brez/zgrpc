@@ -254,15 +254,16 @@ in docs/notes.md. The loopback numbers there were re-measured on a quiet
 machine (three runs; p50 is stable, p99/p999 are not).
 
 Next up:
-- The TSDB is still in planning, so it has no AZ layout or instance type yet.
-  The 2026-10-19 run used c7g.large and 1a-1a / 1a-1c (c7g.large is not
-  offered in 1b); rerun `vpc/run.sh` once the TSDB has either. It will run on
-  AWS in us-east-1.
-- Revisit `reset_limit` once the TSDB's peak call rate is known. Resets arrive
-  at about the offered rate when callers time out in bulk, and the limit is per
-  connection: check that 2,000/s sits well above peak rate divided by pool size
-  (default 4), and raise it if not. Not `null`, which removes the only
-  protection against a client resetting in a loop.
+- Milestone 2 is a reference measurement, not a gate on any consumer: the
+  2026-10-19 run is one machine type (c7g.large) in one region (us-east-1, 1a-1a
+  and 1a-1c; c7g.large is not offered in 1b). Anyone with different hardware
+  or placement reruns `vpc/run.sh` and compares; no consumer's layout is
+  waited on.
+- `reset_limit` is a library default (2,000/s per connection, burst 4,000),
+  untested against a real outage pattern. The README says how to size it
+  (above peak call rate divided by pool size); raise it for a busier pool, not
+  `null`, which removes the only protection against a client resetting in a
+  loop.
 - Let harvezter use the stubs (released in v0.3.0): bump its pin, and adopt the
   generated client and `Methods(Impl)` once it has a `.proto` of its own.
 - The wired-Ethernet two-host check is no longer needed ahead of anything.
