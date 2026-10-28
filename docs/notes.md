@@ -329,6 +329,37 @@ still runs its handler to the first read or write that notices. A stream
 handler does that promptly; a unary handler that is purely CPU does not,
 because nothing preempts it.
 
+## TLS (not built)
+
+What Zig 0.16.0's `std.crypto.tls` offers, read from
+`lib/std/crypto/tls.zig` and `tls/Client.zig` on 2026-10-27:
+
+- **No server side.** `tls/` holds `Client.zig` only; there is no `tls.Server`.
+  Accepting TLS means writing a TLS 1.3 server handshake ourselves.
+- **No ALPN.** `application_layer_protocol_negotiation` appears only as an
+  extension-type enum value. The ClientHello is built at comptime from a fixed
+  extension list (`supported_versions`, `signature_algorithms`,
+  `supported_groups`, `psk_key_exchange_modes`, `key_share`, `server_name`) and
+  `Client.Options` has no hook to add one, so offering `h2` means vendoring or
+  patching `Client.zig`.
+- What the client does give us: certificate verification against a CA bundle or
+  a self-signed certificate, host checking, and a reader/writer over a stream.
+
+Not verified: that recent grpc-go servers reject a TLS connection that did not
+negotiate `h2` by ALPN. Check before relying on it either way.
+
+Plan, in order:
+
+1. **Client only**: vendor `Client.zig` with an ALPN extension and read the
+   server's choice, so zgrpc can call TLS endpoints. Bounded work on code that
+   already runs.
+2. **Measure**: handshake cost against the ~5ms budget, and a TLS run of the
+   benchmark. Pooled connections are long-lived, so this should be a connect-time
+   cost, not a per-call one.
+3. **Interop**: `interop/run.sh` against grpc-go over TLS.
+4. **Server**, decided after the above: a TLS 1.3 server of our own, or C
+   interop with BoringSSL/OpenSSL, which gives up the pure-Zig property.
+
 ## Interop findings
 
 Bugs found this way that the internal tests missed:
