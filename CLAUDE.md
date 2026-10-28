@@ -20,10 +20,12 @@ first real consumer, but the API should stay general enough for others.
   to interoperate with them, not just with itself.
 - **Latency target: ~5ms** for unary calls, in-VPC. This is a p50 *and*
   tail-latency (p99/p999) concern, not just an average.
-- **h2c (plaintext HTTP/2), no TLS.** All current consumers run inside a
-  single trusted VPC. Confirm this assumption still holds before any
-  consumer relies on it outside that context — TLS/ALPN support can be
-  added later if a use case needs it, but isn't in scope now.
+- **h2c (plaintext HTTP/2) today; TLS is planned.** All current consumers run
+  inside a single trusted VPC, and until TLS exists that is the only place
+  zgrpc is safe to use: confirm it before any consumer relies on it outside
+  that context. The goal being a general-purpose library (2026-10-19), TLS is
+  no longer deferred until a use case appears; it is the next item (see "Next
+  up", and "TLS" in docs/notes.md for what Zig's std offers).
 
 ## Scope discipline
 
@@ -35,12 +37,12 @@ consumer to validate the abstractions against:
 - No client-side load balancing, no service discovery. These are real gRPC
   features but nobody needs them yet. (Interceptors and retries were on this
   list and are built; see the exception below.)
-- No TLS/ALPN until a concrete use case requires leaving the VPC.
+- TLS/ALPN is no longer on this list: it is planned (see the exception below).
 
 One deliberate exception: on 2026-10-19 the stated goal became a general-purpose
 library, not one shaped around harvezter, so stubs, interceptors and retries were
-built ahead of a second consumer, and name resolution and load balancing are
-planned (see "Next up"). The rule above still governs everything else on that
+built ahead of a second consumer, and TLS, name resolution and load balancing
+are planned (see "Next up"). The rule above still governs everything else on that
 list.
 
 ## Architecture (layers, bottom to top)
@@ -298,6 +300,13 @@ in docs/notes.md. The loopback numbers there were re-measured on a quiet
 machine (three runs; p50 is stable, p99/p999 are not).
 
 Next up:
+- TLS, ahead of the `Channel`. std.crypto.tls (0.16.0) has a client and no
+  server, and no ALPN, so: first a client-only TLS, vendoring `Client.zig` with
+  an ALPN extension so zgrpc can call TLS endpoints; then a handshake-cost and
+  benchmark run; then interop over TLS against grpc-go; then decide the server
+  side (our own TLS 1.3 server, or C interop at the cost of the pure-Zig
+  property). Plan and findings in docs/notes.md under "TLS". Unverified: whether
+  grpc-go rejects a connection that did not negotiate `h2` by ALPN.
 - Milestone 2 is a reference measurement, not a gate on any consumer: the
   2026-10-19 run is one machine type (c7g.large) in one region (us-east-1, 1a-1a
   and 1a-1c; c7g.large is not offered in 1b). Anyone with different hardware
